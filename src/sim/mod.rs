@@ -6,6 +6,7 @@ pub mod mist;
 pub mod recorder;
 pub mod robot_view;
 pub mod state;
+pub mod textures;
 
 use bevy::prelude::*;
 use state::SimStepSet;

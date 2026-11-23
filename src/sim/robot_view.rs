@@ -3,14 +3,16 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use bevy::{
     asset::RenderAssetUsages,
     camera::visibility::NoFrustumCulling,
-    image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    render::render_resource::TextureFormat,
 };
 
 use crate::core::types::{LinkTransform, NozzleCap, RackSlotPose};
 use crate::sim::state::{AppConfig, SimStepSet, SprayJobRes};
+use crate::sim::textures::{
+    MipmapKind, create_mipmapped_pbr_triplet, create_mipmapped_rgba8_image,
+};
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<HeldCanSlot>()
@@ -308,7 +310,7 @@ fn spawn_robot_and_cans(
             ));
             // Base degree scale collar
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.1275, 0.022).mesh().resolution(40).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.1280, 0.022).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.0, -0.384, 0.0),
             ));
@@ -423,7 +425,7 @@ fn spawn_robot_and_cans(
             ));
             // Machined degree scale band around shoulder drum
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0835, 0.022).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0840, 0.022).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.086, 0.0, 0.0).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
@@ -513,7 +515,7 @@ fn spawn_robot_and_cans(
         });
 
     // Link 3: upper_arm_roll rotary swivel joint at mid-upper-arm (+Y axis, extends +Y by L2 * 0.5 = 0.34m to elbow_pitch)
-    let swivel_bolts = bolt_ring_transforms(0.059, 8, Vec3::Y, Vec3::new(0.0, 0.030, 0.0));
+    let swivel_bolts = bolt_ring_transforms(0.059, 8, Vec3::Y, Vec3::new(0.0, 0.0310, 0.0));
     commands
         .spawn((RobotLink { index: 3 }, link_tf(3), Visibility::default()))
         .with_children(|p| {
@@ -529,7 +531,7 @@ fn spawn_robot_and_cans(
                 Transform::from_xyz(0.0, 0.018, 0.0),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0672, 0.014).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0680, 0.014).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.0, 0.018, 0.0),
             ));
@@ -604,7 +606,7 @@ fn spawn_robot_and_cans(
                 Transform::from_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0695, 0.020).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0700, 0.020).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.072, 0.0, 0.0).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
@@ -1302,8 +1304,8 @@ fn build_robot_materials(
     let degree_scale = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(images.add(build_degree_scale_collar_texture(512, 64))),
-        metallic: 0.75,
-        perceptual_roughness: 0.28,
+        metallic: 0.68,
+        perceptual_roughness: 0.34,
         ..default()
     });
     let led_green = materials.add(StandardMaterial {
@@ -1373,35 +1375,6 @@ fn fbm(x: f32, y: f32, seed: u32) -> f32 {
     sum
 }
 
-fn create_rgba8_image(width: u32, height: u32, data: Vec<u8>, format: TextureFormat) -> Image {
-    let mut img = Image::new(
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        format,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    img.sampler = ImageSampler::linear();
-    img
-}
-
-fn create_rgba8_repeating_image(
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
-    format: TextureFormat,
-) -> Image {
-    let mut img = create_rgba8_image(width, height, data, format);
-    let mut desc = ImageSamplerDescriptor::linear();
-    desc.set_address_mode(ImageAddressMode::Repeat);
-    img.sampler = ImageSampler::Descriptor(desc);
-    img
-}
-
 fn normal_map_from_heights(heights: &[f32], width: u32, height: u32, strength: f32) -> Vec<u8> {
     let mut out = Vec::with_capacity((width * height * 4) as usize);
     let w = width as i32;
@@ -1443,8 +1416,8 @@ fn build_cast_iron_textures(size: u32) -> (Image, Image, Image) {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
             let macro_grain = fbm(u * 14.0, v * 14.0, 101);
-            let pebble = fbm(u * 62.0, v * 62.0, 137);
-            let micro_pit = hash2(x as i32, y as i32, 173);
+            let pebble = fbm(u * 36.0, v * 36.0, 137);
+            let micro_pit = value_noise(u * 48.0, v * 48.0, 173);
 
             let crest = (pebble * 0.72 + micro_pit * 0.28).clamp(0.0, 1.0);
             let luma = (0.155 + 0.038 * macro_grain + 0.036 * crest).clamp(0.11, 0.25);
@@ -1464,12 +1437,8 @@ fn build_cast_iron_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 2.2);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 1.5);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Safety orange armor: powder-coat orange-peel normal + subtle edge wear + optional distal dried spray mist.
@@ -1494,13 +1463,13 @@ fn build_safety_orange_textures(size: u32, mist_strength: f32) -> (Image, Image,
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
 
-            let orange_peel = fbm(u * 44.0, v * 44.0, 211);
-            let micro_coat = fbm(u * 96.0, v * 96.0, 239);
+            let orange_peel = fbm(u * 24.0, v * 24.0, 211);
+            let micro_coat = value_noise(u * 48.0, v * 48.0, 239);
             let panel_var = fbm(u * 6.0, v * 6.0, 257);
 
             // Subtle edge/collar wear near v=0 or v=1 (plus faint corner scuffs)
             let edge_dist = v.min(1.0 - v);
-            let wear_noise = fbm(u * 26.0, v * 26.0, 277);
+            let wear_noise = fbm(u * 20.0, v * 20.0, 277);
             let edge_mask = ((0.055 - edge_dist) / 0.055).clamp(0.0, 1.0);
             let wear = ((edge_mask * 1.15 + (wear_noise - 0.68) * 1.8).clamp(0.0, 1.0)
                 * edge_mask)
@@ -1564,12 +1533,8 @@ fn build_safety_orange_textures(size: u32, mist_strength: f32) -> (Image, Image,
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.25);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.65);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Anodized dark joints: lathe-turned concentric micro-grooves + darker recessed contrast.
@@ -1583,9 +1548,9 @@ fn build_anodized_dark_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            let lathe = (v * 90.0 * TAU).sin() * 0.5 + 0.5;
-            let band = fbm(u * 4.0, v * 36.0, 401);
-            let micro = fbm(u * 28.0, v * 64.0, 419);
+            let lathe = (v * 32.0 * TAU).sin() * 0.5 + 0.5;
+            let band = fbm(u * 4.0, v * 20.0, 401);
+            let micro = fbm(u * 18.0, v * 36.0, 419);
 
             let recessed = ((0.06 - v.min(1.0 - v)) / 0.06).clamp(0.0, 1.0);
             let luma = (0.088 + 0.018 * band + 0.010 * lathe - 0.022 * recessed).clamp(0.055, 0.14);
@@ -1605,15 +1570,11 @@ fn build_anodized_dark_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.35);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.75);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
-/// Brushed aluminum: directional brushed-metal streaks + crisp studio HDR tube reflections.
+/// Brushed aluminum: band-limited directional brushed-metal streaks + crisp studio HDR tube reflections.
 fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
     let n = (size * size) as usize;
     let mut albedo = Vec::with_capacity(n * 4);
@@ -1624,13 +1585,12 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            // Fine anisotropic streaks running primarily along U
-            let streak_fine = value_noise(u * 10.0, v * 170.0, 503);
-            let streak_med = fbm(u * 5.0, v * 72.0, 521);
-            let micro = hash2(x as i32, y as i32, 541) * 0.08;
+            // Band-limited anisotropic brushed streaks running primarily along U (no raw per-texel hash)
+            let streak_fine = value_noise(u * 8.0, v * 64.0, 503);
+            let streak_med = fbm(u * 4.0, v * 28.0, 521);
 
-            let brush = (streak_fine * 0.60 + streak_med * 0.35 + micro).clamp(0.0, 1.0);
-            let luma = (0.73 + 0.10 * brush).clamp(0.68, 0.87);
+            let brush = (streak_fine * 0.60 + streak_med * 0.40).clamp(0.0, 1.0);
+            let luma = (0.74 + 0.08 * brush).clamp(0.70, 0.86);
             albedo.extend_from_slice(&[
                 to_u8(luma * 0.97),
                 to_u8(luma * 0.99),
@@ -1638,8 +1598,8 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
                 255,
             ]);
 
-            // Low roughness (0.16..0.26) + high metallic (0.92..0.95) for crisp tube reflections
-            let roughness = (0.16 + 0.10 * (1.0 - brush)).clamp(0.15, 0.28);
+            // Low roughness (0.18..0.28) + high metallic (0.93) for smooth studio tube reflections
+            let roughness = (0.18 + 0.10 * (1.0 - brush)).clamp(0.18, 0.28);
             let metallic = 0.93_f32;
             rough_metal.extend_from_slice(&[0, to_u8(roughness), to_u8(metallic), 255]);
 
@@ -1647,12 +1607,8 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 0.85);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.40);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Structural satin graphite-steel finish for riser & spine ribs.
@@ -1666,7 +1622,7 @@ fn build_graphite_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            let grain = fbm(u * 40.0, v * 40.0, 601);
+            let grain = fbm(u * 32.0, v * 32.0, 601);
             let blotch = fbm(u * 9.0, v * 9.0, 617);
             let luma = (0.235 + 0.055 * blotch + 0.032 * grain).clamp(0.18, 0.34);
             albedo.extend_from_slice(&[
@@ -1684,12 +1640,8 @@ fn build_graphite_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.35);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 1.15);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Rubber / Gripper pads: diamond-knurled & ribbed tactile pad texture.
@@ -1706,7 +1658,7 @@ fn build_rubber_grip_textures(size: u32) -> (Image, Image, Image) {
             let d1 = ((u + v) * 26.0 * PI).sin().abs();
             let d2 = ((u - v) * 26.0 * PI).sin().abs();
             let knurl = (d1 * d2).powf(0.65);
-            let micro = fbm(u * 48.0, v * 48.0, 701);
+            let micro = fbm(u * 36.0, v * 36.0, 701);
 
             let luma = (0.048 + 0.028 * knurl + 0.010 * micro).clamp(0.035, 0.095);
             albedo.extend_from_slice(&[to_u8(luma), to_u8(luma), to_u8(luma * 1.06), 255]);
@@ -1718,12 +1670,8 @@ fn build_rubber_grip_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 3.0);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 2.6);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Corrugated black polymer dress-pack conduit (`rings_along_v = true` for Cylinder, `false` for Torus).
@@ -1738,8 +1686,8 @@ fn build_conduit_textures(size: u32, rings_along_v: bool) -> (Image, Image, Imag
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
             let axis = if rings_along_v { v } else { u };
-            let ridge = ((axis * 54.0 * TAU).sin() * 0.5 + 0.5).powf(0.8);
-            let micro = fbm(u * 32.0, v * 32.0, 809);
+            let ridge = ((axis * 36.0 * TAU).sin() * 0.5 + 0.5).powf(0.8);
+            let micro = fbm(u * 24.0, v * 24.0, 809);
 
             let luma = (0.055 + 0.036 * ridge + 0.010 * micro).clamp(0.04, 0.12);
             albedo.extend_from_slice(&[to_u8(luma), to_u8(luma), to_u8(luma * 1.05), 255]);
@@ -1751,12 +1699,8 @@ fn build_conduit_textures(size: u32, rings_along_v: bool) -> (Image, Image, Imag
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 3.2);
-    (
-        create_rgba8_repeating_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_repeating_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_repeating_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 2.2);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 #[inline]
@@ -1923,7 +1867,15 @@ fn build_unit07_stencil_texture(width: u32, height: u32) -> Image {
         }
     }
 
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
 /// Yellow-and-black diagonal pinch/crush hazard chevron band texture.
@@ -1952,7 +1904,15 @@ fn build_hazard_chevron_texture(width: u32, height: u32) -> Image {
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
 /// Radial machined servo encoder dial cap texture (`256x256`).
@@ -1997,10 +1957,31 @@ fn build_encoder_dial_texture(size: u32) -> Image {
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(size, size, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        size,
+        size,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
-/// Cylindrical wrap-around degree scale ring texture (`512x64`).
+#[inline]
+fn wrap_unit_dist(phase: f32) -> f32 {
+    let f = phase.fract();
+    f.min(1.0 - f)
+}
+
+#[inline]
+fn smooth_falloff(dist: f32, half_width: f32, aa_width: f32) -> f32 {
+    let t = ((dist - half_width) / aa_width).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// Cylindrical wrap-around degree scale ring texture (`512x64`) with anti-aliased etched
+/// 30° major & 10° medium ticks (no sub-pixel moiré ticks).
 fn build_degree_scale_collar_texture(width: u32, height: u32) -> Image {
     let mut data = Vec::with_capacity((width * height * 4) as usize);
 
@@ -2009,28 +1990,56 @@ fn build_degree_scale_collar_texture(width: u32, height: u32) -> Image {
             let u = (px as f32 + 0.5) / width as f32;
             let v = (py as f32 + 0.5) / height as f32;
 
-            let mut rgb = [0.58_f32, 0.61, 0.66];
-            if v < 0.12 || v > 0.88 {
-                rgb = [0.11, 0.12, 0.14];
+            // Smooth brushed satin aluminum base band with chamfered dark borders
+            let rim_fade = (1.0 - smooth_falloff((v - 0.12).max(0.0), 0.0, 0.03))
+                .max(1.0 - smooth_falloff((0.88 - v).max(0.0), 0.0, 0.03));
+            let base = [0.56_f32, 0.59, 0.64];
+            let border = [0.11_f32, 0.12, 0.14];
+            let mut rgb = if v < 0.12 || v > 0.88 {
+                border
             } else {
-                let p12 = (u * 12.0).fract();
-                let p36 = (u * 36.0).fract();
-                let p72 = (u * 72.0).fract();
-                let major = (p12 < 0.055 || p12 > 0.945) && (0.16..=0.84).contains(&v);
-                let med = (p36 < 0.08 || p36 > 0.92) && (0.28..=0.84).contains(&v);
-                let fine = (p72 < 0.10 || p72 > 0.90) && (0.52..=0.84).contains(&v);
+                [
+                    base[0] * (1.0 - rim_fade) + border[0] * rim_fade,
+                    base[1] * (1.0 - rim_fade) + border[1] * rim_fade,
+                    base[2] * (1.0 - rim_fade) + border[2] * rim_fade,
+                ]
+            };
 
-                if u < 0.008 || u > 0.992 {
-                    rgb = [0.91, 0.36, 0.10];
-                } else if major || med || fine {
-                    rgb = [0.09, 0.10, 0.12];
+            if (0.12..=0.88).contains(&v) {
+                let d12 = wrap_unit_dist(u * 12.0) / 12.0;
+                let d36 = wrap_unit_dist(u * 36.0) / 36.0;
+                let datum_d = wrap_unit_dist(u);
+
+                let datum_w = smooth_falloff(datum_d, 0.0045, 0.0030)
+                    * smooth_falloff((0.50 - v).abs(), 0.34, 0.03);
+                let major_w = smooth_falloff(d12, 0.0028, 0.0018)
+                    * smooth_falloff((0.50 - v).abs(), 0.28, 0.03);
+                let med_w = smooth_falloff(d36, 0.0018, 0.0014)
+                    * smooth_falloff((0.56 - v).abs(), 0.20, 0.03);
+
+                let tick_w = major_w.max(med_w * 0.85);
+                let tick_col = [0.12_f32, 0.13, 0.15];
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * (1.0 - tick_w) + tick_col[c] * tick_w;
+                }
+                let datum_col = [0.91_f32, 0.36, 0.10];
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * (1.0 - datum_w) + datum_col[c] * datum_w;
                 }
             }
 
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        true,
+        false,
+    )
 }
 
 /// Generates a procedural 256x256 wraparound aerosol can litho label with prominent color swatch
@@ -2143,8 +2152,24 @@ fn build_spray_can_label_textures(
     }
 
     (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
+        create_mipmapped_rgba8_image(
+            size,
+            size,
+            albedo,
+            TextureFormat::Rgba8UnormSrgb,
+            MipmapKind::SrgbColor,
+            true,
+            false,
+        ),
+        create_mipmapped_rgba8_image(
+            size,
+            size,
+            rough_metal,
+            TextureFormat::Rgba8Unorm,
+            MipmapKind::LinearData,
+            true,
+            false,
+        ),
     )
 }
 
@@ -2826,6 +2851,8 @@ mod tests {
 
     #[test]
     fn procedural_robot_textures_and_tangent_meshes_are_valid() {
+        use crate::sim::textures::{mip_chain_byte_len_rgba8, mip_level_count_2d};
+
         for (a, rm, n) in [
             build_cast_iron_textures(64),
             build_safety_orange_textures(64, 0.0),
@@ -2839,31 +2866,61 @@ mod tests {
             for img in [&a, &rm, &n] {
                 assert_eq!(img.texture_descriptor.size.width, 64);
                 assert_eq!(img.texture_descriptor.size.height, 64);
-                assert_eq!(img.data.as_ref().map(|d| d.len()), Some(64 * 64 * 4));
+                assert_eq!(img.texture_descriptor.mip_level_count, mip_level_count_2d(64, 64));
+                assert_eq!(
+                    img.data.as_ref().map(|d| d.len()),
+                    Some(mip_chain_byte_len_rgba8(64, 64))
+                );
             }
         }
 
         let unit07 = build_unit07_stencil_texture(512, 192);
         assert_eq!(unit07.texture_descriptor.size.width, 512);
         assert_eq!(unit07.texture_descriptor.size.height, 192);
-        assert_eq!(unit07.data.as_ref().map(|d| d.len()), Some(512 * 192 * 4));
+        assert_eq!(
+            unit07.texture_descriptor.mip_level_count,
+            mip_level_count_2d(512, 192)
+        );
+        assert_eq!(
+            unit07.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(512, 192))
+        );
 
         let chev = build_hazard_chevron_texture(256, 64);
         assert_eq!(chev.texture_descriptor.size.width, 256);
         assert_eq!(chev.texture_descriptor.size.height, 64);
+        assert_eq!(
+            chev.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(256, 64))
+        );
 
         let dial = build_encoder_dial_texture(128);
         assert_eq!(dial.texture_descriptor.size.width, 128);
         assert_eq!(dial.texture_descriptor.size.height, 128);
+        assert_eq!(
+            dial.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
 
         let scale = build_degree_scale_collar_texture(256, 32);
         assert_eq!(scale.texture_descriptor.size.width, 256);
         assert_eq!(scale.texture_descriptor.size.height, 32);
+        assert_eq!(
+            scale.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(256, 32))
+        );
 
         let (can_a, can_rm) = build_spray_can_label_textures([232, 93, 26], 0, 128);
         assert_eq!(can_a.texture_descriptor.size.width, 128);
         assert_eq!(can_rm.texture_descriptor.size.height, 128);
-        assert_eq!(can_a.data.as_ref().map(|d| d.len()), Some(128 * 128 * 4));
+        assert_eq!(
+            can_a.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
+        assert_eq!(
+            can_rm.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
 
         // Verify tangent generation succeeds on every primitive type used on the robot
         let meshes_with_tangents = [

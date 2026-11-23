@@ -2,7 +2,6 @@ use std::f32::consts::{FRAC_PI_2, PI};
 
 use bevy::{
     asset::RenderAssetUsages,
-    image::ImageSampler,
     light::{
         CascadeShadowConfigBuilder, FogVolume, GeneratedEnvironmentMapLight, GlobalAmbientLight,
         NotShadowCaster, NotShadowReceiver, Skybox, VolumetricLight,
@@ -16,6 +15,9 @@ use bevy::{
 
 use crate::core::types::StudioConfig;
 use crate::sim::state::AppConfig;
+use crate::sim::textures::{
+    MipmapKind, create_mipmapped_pbr_triplet, create_mipmapped_rgba8_image,
+};
 
 pub fn plugin(app: &mut App) {
     app.add_systems(Startup, setup_studio_environment)
@@ -2091,22 +2093,6 @@ fn fbm(x: f32, y: f32, seed: u32) -> f32 {
     sum
 }
 
-fn create_rgba8_image(width: u32, height: u32, data: Vec<u8>, format: TextureFormat) -> Image {
-    let mut img = Image::new(
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        format,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    img.sampler = ImageSampler::linear();
-    img
-}
-
 #[derive(Clone, Copy)]
 struct MistPatch {
     x: f32,
@@ -2236,11 +2222,7 @@ fn build_concrete_floor_textures(size: u32) -> (Image, Image, Image) {
     }
 
     let normal = normal_map_from_heights(&heights, size, 1.8);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(size, size, albedo, rough, normal, false, false)
 }
 
 fn build_drop_cloth_textures(width: u32, height: u32) -> (Image, Image, Image) {
@@ -2331,11 +2313,7 @@ fn build_drop_cloth_textures(width: u32, height: u32) -> (Image, Image, Image) {
         }
     }
 
-    (
-        create_rgba8_image(width, height, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(width, height, rough, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(width, height, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(width, height, albedo, rough, normal, false, false)
 }
 
 fn build_corrugated_panel_textures(size: u32, ribs_along_v: bool) -> (Image, Image, Image) {
@@ -2394,11 +2372,7 @@ fn build_corrugated_panel_textures(size: u32, ribs_along_v: bool) -> (Image, Ima
     }
 
     let normal = normal_map_from_heights(&heights, size, 2.4);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(size, size, albedo, rough, normal, false, false)
 }
 
 fn build_ceiling_deck_textures(size: u32) -> (Image, Image, Image) {
@@ -2434,11 +2408,7 @@ fn build_ceiling_deck_textures(size: u32) -> (Image, Image, Image) {
     }
 
     let normal = normal_map_from_heights(&heights, size, 2.0);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(size, size, albedo, rough, normal, false, false)
 }
 
 fn build_industrial_wall_textures(width: u32, height: u32) -> (Image, Image, Image) {
@@ -2555,11 +2525,7 @@ fn build_industrial_wall_textures(width: u32, height: u32) -> (Image, Image, Ima
     }
 
     let normal = normal_map_from_heights_rect(&heights, width, height, 2.4);
-    (
-        create_rgba8_image(width, height, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(width, height, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(width, height, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(width, height, albedo, rough_metal, normal, false, false)
 }
 
 fn build_wood_grain_textures(size: u32) -> (Image, Image, Image) {
@@ -2595,11 +2561,7 @@ fn build_wood_grain_textures(size: u32) -> (Image, Image, Image) {
     }
 
     let normal = normal_map_from_heights(&heights, size, 1.5);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, false, false)
 }
 
 fn build_light_shaft_texture(width: u32, height: u32) -> Image {
@@ -2615,7 +2577,15 @@ fn build_light_shaft_texture(width: u32, height: u32) -> Image {
             data.extend_from_slice(&[255, 255, 255, (alpha * 255.0).round() as u8]);
         }
     }
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
 /// Builds an open-ended frustum mesh (`y = +height/2` at `r_top`, `y = -height/2` at `r_bot`)
