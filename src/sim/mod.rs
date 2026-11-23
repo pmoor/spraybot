@@ -7,7 +7,7 @@ pub mod recorder;
 pub mod robot_view;
 pub mod state;
 
-use bevy::{pbr::DefaultOpaqueRendererMethod, prelude::*};
+use bevy::prelude::*;
 use state::SimStepSet;
 
 /// Master Bevy plugin registering all SprayBot studio, robot, canvas, FX, camera, and export systems.
@@ -15,7 +15,6 @@ pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(DefaultOpaqueRendererMethod::deferred());
         app.configure_sets(
             Update,
             (

@@ -7,10 +7,7 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
     light::VolumetricFog,
-    pbr::{
-        ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel,
-        ScreenSpaceReflections,
-    },
+    pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
     post_process::{
         bloom::Bloom,
         dof::{DepthOfField, DepthOfFieldMode},
@@ -219,16 +216,9 @@ fn spawn_camera(
             radius: 0.30,
             constant_object_thickness: 0.08,
         },
-        ScreenSpaceReflections {
-            min_perceptual_roughness: 0.04..0.10,
-            max_perceptual_roughness: 0.52..0.64,
-            thickness: 0.25,
-            linear_steps: 16,
-            linear_march_exponent: 1.5,
-            bisection_steps: 4,
-            use_secant: true,
-            edge_fadeout: 0.02..0.10,
-        },
+        // Specular & clearcoat reflections are driven by `GeneratedEnvironmentMapLight` + PBR
+        // studio lights rather than Bevy's un-denoised 1-SPP stochastic SSR, preventing per-frame
+        // dithering flicker on stationary reflective surfaces.
         VolumetricFog {
             ambient_color: Color::srgb(0.86, 0.90, 0.96),
             ambient_intensity: 0.02,
