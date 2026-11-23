@@ -4,7 +4,10 @@ use bevy::{
     anti_alias::smaa::Smaa,
     app::AppExit,
     camera::{Hdr, RenderTarget, ShadowLodOrigin},
-    core_pipeline::tonemapping::Tonemapping,
+    core_pipeline::{
+        prepass::{DeferredPrepass, DepthPrepass},
+        tonemapping::Tonemapping,
+    },
     input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
     light::VolumetricFog,
     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
@@ -210,15 +213,17 @@ fn spawn_camera(
         ShadowLodOrigin,
         Hdr,
         Msaa::Off,
+        DepthPrepass,
+        DeferredPrepass,
         Smaa::default(),
         ScreenSpaceAmbientOcclusion {
             quality_level: ScreenSpaceAmbientOcclusionQualityLevel::High,
             radius: 0.30,
             constant_object_thickness: 0.08,
         },
-        // Specular & clearcoat reflections are driven by `GeneratedEnvironmentMapLight` + PBR
-        // studio lights rather than Bevy's un-denoised 1-SPP stochastic SSR, preventing per-frame
-        // dithering flicker on stationary reflective surfaces.
+        // Deferred prepass keeps Bevy 0.20.1 clearcoat normals intact alongside `SSAO`
+        // (`NormalPrepass`), while omitting `ScreenSpaceReflections` prevents stochastic static
+        // reflection flicker (`GeneratedEnvironmentMapLight` + PBR lights drive reflections).
         VolumetricFog {
             ambient_color: Color::srgb(0.86, 0.90, 0.96),
             ambient_intensity: 0.02,

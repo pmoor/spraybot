@@ -8,7 +8,7 @@ pub mod robot_view;
 pub mod state;
 pub mod textures;
 
-use bevy::prelude::*;
+use bevy::{pbr::DefaultOpaqueRendererMethod, prelude::*};
 use state::SimStepSet;
 
 /// Master Bevy plugin registering all SprayBot studio, robot, canvas, FX, camera, and export systems.
@@ -16,6 +16,10 @@ pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
+        // Use deferred opaque rendering (without stochastic SSR) so Bevy 0.20.1 evaluates
+        // clearcoat using true surface normals (`clearcoat_N = N`), avoiding forward
+        // `LOAD_PREPASS_NORMALS` clearcoat washout when `SSAO` / `NormalPrepass` is active.
+        app.insert_resource(DefaultOpaqueRendererMethod::deferred());
         app.configure_sets(
             Update,
             (
