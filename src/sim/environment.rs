@@ -4,9 +4,10 @@ use bevy::{
     asset::RenderAssetUsages,
     image::ImageSampler,
     light::{
-        CascadeShadowConfigBuilder, GeneratedEnvironmentMapLight, GlobalAmbientLight,
-        NotShadowCaster, Skybox,
+        CascadeShadowConfigBuilder, FogVolume, GeneratedEnvironmentMapLight, GlobalAmbientLight,
+        NotShadowCaster, NotShadowReceiver, Skybox, VolumetricLight,
     },
+    mesh::{Indices, PrimitiveTopology},
     prelude::*,
     render::render_resource::{
         Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
@@ -69,7 +70,7 @@ fn setup_studio_environment(
     spawn_studio_room(&mut commands, &mut meshes, &mut materials, &mut images);
 
     // 3. Wooden canvas stretcher frame + backing behind Z = 0.00m
-    spawn_canvas_stretcher(&mut commands, &mut meshes, &mut materials, studio);
+    spawn_canvas_stretcher(&mut commands, &mut meshes, &mut materials, &mut images, studio);
 
     // 4. Machined 3.80m steel linear floor rail at Z = 0.95m
     spawn_floor_rail(&mut commands, &mut meshes, &mut materials, studio);
@@ -83,8 +84,8 @@ fn setup_studio_environment(
         app_config.cli.max_cans,
     );
 
-    // 6. Studio lighting (cool skylight, neutral canvas key, cool rack key, warm amber side work-light, ceiling tube fixtures)
-    spawn_studio_lights(&mut commands, &mut meshes, &mut materials);
+    // 6. Studio lighting (cool skylight, neutral canvas key, cool rack key, warm amber side work-light, ceiling tube fixtures, volumetric haze)
+    spawn_studio_lights(&mut commands, &mut meshes, &mut materials, &mut images);
 }
 
 fn spawn_studio_room(
@@ -113,6 +114,8 @@ fn spawn_studio_room(
         metallic: 0.0,
         perceptual_roughness: 1.0,
         reflectance: 0.42,
+        clearcoat: 0.28,
+        clearcoat_perceptual_roughness: 0.26,
         ..default()
     });
     commands.spawn((
@@ -124,9 +127,10 @@ fn spawn_studio_room(
     // Taped kraft-paper / canvas drop-cloth runner under the canvas (Z in [0.04, 0.72], clear of rail at Z = 0.95)
     spawn_drop_cloth_runner(commands, meshes, materials, images);
 
-    // Back wall (Z = -0.04m front surface) with industrial brick/concrete block texture
-    let (wall_albedo, wall_normal) = build_industrial_wall_textures(512);
+    // Back wall (Z = -0.04m front surface) with non-repeating weathered CMU block texture
+    let (wall_albedo, wall_rough, wall_normal) = build_industrial_wall_textures(1280, 640);
     let wall_albedo_h = images.add(wall_albedo);
+    let wall_rough_h = images.add(wall_rough);
     let wall_normal_h = images.add(wall_normal);
 
     let back_wall_mesh = meshes.add(
@@ -137,10 +141,12 @@ fn spawn_studio_room(
             .expect("wall tangents"),
     );
     let back_wall_mat = materials.add(StandardMaterial {
-        base_color_texture: Some(wall_albedo_h.clone()),
-        normal_map_texture: Some(wall_normal_h.clone()),
-        perceptual_roughness: 0.86,
-        metallic: 0.02,
+        base_color_texture: Some(wall_albedo_h),
+        metallic_roughness_texture: Some(wall_rough_h),
+        normal_map_texture: Some(wall_normal_h),
+        perceptual_roughness: 1.0,
+        metallic: 0.0,
+        reflectance: 0.35,
         ..default()
     });
     commands.spawn((
@@ -344,12 +350,18 @@ fn spawn_canvas_stretcher(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    images: &mut ResMut<Assets<Image>>,
     studio: &crate::core::types::StudioConfig,
 ) {
+    let (wood_a, wood_r, wood_n) = build_wood_grain_textures(256);
     let wood_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.68, 0.52, 0.34),
-        perceptual_roughness: 0.72,
+        base_color: Color::WHITE,
+        base_color_texture: Some(images.add(wood_a)),
+        metallic_roughness_texture: Some(images.add(wood_r)),
+        normal_map_texture: Some(images.add(wood_n)),
+        perceptual_roughness: 1.0,
         metallic: 0.0,
+        reflectance: 0.35,
         ..default()
     });
     let backing_mat = materials.add(StandardMaterial {
@@ -364,6 +376,12 @@ fn spawn_canvas_stretcher(
         perceptual_roughness: 0.38,
         ..default()
     });
+    let staple_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.76, 0.79, 0.83),
+        metallic: 0.90,
+        perceptual_roughness: 0.24,
+        ..default()
+    });
 
     let w = studio.canvas_width; // 2.50m
     let h = studio.canvas_height; // 1.50m
@@ -375,7 +393,13 @@ fn spawn_canvas_stretcher(
     let frame_bar = 0.055;
 
     // Top and bottom stretcher rails
-    let horiz_mesh = meshes.add(Cuboid::new(w, frame_bar, d));
+    let horiz_mesh = meshes.add(
+        Cuboid::new(w, frame_bar, d)
+            .mesh()
+            .build()
+            .with_generated_tangents()
+            .expect("horiz stretcher tangents"),
+    );
     commands.spawn((
         Mesh3d(horiz_mesh.clone()),
         MeshMaterial3d(wood_mat.clone()),
@@ -388,7 +412,13 @@ fn spawn_canvas_stretcher(
     ));
 
     // Left and right stretcher stiles
-    let vert_mesh = meshes.add(Cuboid::new(frame_bar, h - 2.0 * frame_bar, d));
+    let vert_mesh = meshes.add(
+        Cuboid::new(frame_bar, h - 2.0 * frame_bar, d)
+            .mesh()
+            .build()
+            .with_generated_tangents()
+            .expect("vert stretcher tangents"),
+    );
     commands.spawn((
         Mesh3d(vert_mesh.clone()),
         MeshMaterial3d(wood_mat.clone()),
@@ -402,12 +432,28 @@ fn spawn_canvas_stretcher(
 
     // Internal cross-braces
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.045, h - 2.0 * frame_bar, d * 0.8))),
+        Mesh3d(
+            meshes.add(
+                Cuboid::new(0.045, h - 2.0 * frame_bar, d * 0.8)
+                    .mesh()
+                    .build()
+                    .with_generated_tangents()
+                    .expect("brace tangents"),
+            ),
+        ),
         MeshMaterial3d(wood_mat.clone()),
         Transform::from_xyz(cx, cy, cz - 0.003),
     ));
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(w - 2.0 * frame_bar, 0.045, d * 0.8))),
+        Mesh3d(
+            meshes.add(
+                Cuboid::new(w - 2.0 * frame_bar, 0.045, d * 0.8)
+                    .mesh()
+                    .build()
+                    .with_generated_tangents()
+                    .expect("brace tangents"),
+            ),
+        ),
         MeshMaterial3d(wood_mat),
         Transform::from_xyz(cx, cy, cz - 0.003),
     ));
@@ -418,6 +464,39 @@ fn spawn_canvas_stretcher(
         MeshMaterial3d(backing_mat),
         Transform::from_xyz(cx, cy, -0.009),
     ));
+
+    // Dark-steel corner gusset L-brackets & canvas-wrap staples along outer bevels (strictly z <= -0.003m)
+    let gusset_h = meshes.add(Cuboid::new(0.085, 0.014, d + 0.003));
+    let gusset_v = meshes.add(Cuboid::new(0.014, 0.085, d + 0.003));
+    for &(sx, sy) in &[(-1.0_f32, 1.0_f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+        let ex = cx + sx * (w * 0.5 - 0.040);
+        let ey = cy + sy * (h * 0.5 - 0.006);
+        commands.spawn((
+            Mesh3d(gusset_h.clone()),
+            MeshMaterial3d(bracket_mat.clone()),
+            Transform::from_xyz(ex, ey, cz - 0.002),
+        ));
+        let ex_v = cx + sx * (w * 0.5 - 0.006);
+        let ey_v = cy + sy * (h * 0.5 - 0.040);
+        commands.spawn((
+            Mesh3d(gusset_v.clone()),
+            MeshMaterial3d(bracket_mat.clone()),
+            Transform::from_xyz(ex_v, ey_v, cz - 0.002),
+        ));
+    }
+
+    let staple_side = meshes.add(Cuboid::new(0.0025, 0.011, 0.003));
+    for &sx in &[-1.0_f32, 1.0] {
+        let bx = cx + sx * (w * 0.5 + 0.0008);
+        for k in 0..9 {
+            let sy = cy - h * 0.42 + (k as f32 / 8.0) * (h * 0.84);
+            commands.spawn((
+                Mesh3d(staple_side.clone()),
+                MeshMaterial3d(staple_mat.clone()),
+                Transform::from_xyz(bx, sy, cz + 0.004),
+            ));
+        }
+    }
 
     // Wall-mounting steel cleats
     let cleat_mesh = meshes.add(Cuboid::new(0.10, 0.035, 0.03));
@@ -897,6 +976,81 @@ fn spawn_cap_swap_station(
     }
 }
 
+fn build_wrinkled_drop_cloth_mesh(width: f32, depth: f32, cols: usize, rows: usize) -> Mesh {
+    let cols = cols.max(2);
+    let rows = rows.max(2);
+    let nx = cols + 1;
+    let nz = rows + 1;
+    let total = nx * nz;
+
+    let mut heights = vec![0.0_f32; total];
+    for iz in 0..nz {
+        for ix in 0..nx {
+            let u = ix as f32 / cols as f32;
+            let v = iz as f32 / rows as f32;
+            let edge_u = u.min(1.0 - u) * width;
+            let edge_v = v.min(1.0 - v) * depth;
+            // Taped perimeter border (edge <= 0.038m) lies flat on the concrete floor
+            let fade_u = ((edge_u - 0.038) / 0.07).clamp(0.0, 1.0);
+            let fade_v = ((edge_v - 0.038) / 0.07).clamp(0.0, 1.0);
+            let mask = fade_u * fade_v;
+
+            let crease_x = (fbm(u * 9.0, v * 3.5, 401) - 0.5).abs();
+            let crease_ridge = (1.0 - (crease_x * 9.0).clamp(0.0, 1.0)).powi(3);
+            let fold = ((u * 21.0 + v * 3.0 * PI).sin() * 0.5 + 0.5) * 0.35;
+            heights[iz * nx + ix] = mask * (0.0046 * crease_ridge + 0.0024 * fold);
+        }
+    }
+
+    let dx_step = width / cols as f32;
+    let dz_step = depth / rows as f32;
+    let mut positions = Vec::with_capacity(total);
+    let mut normals = Vec::with_capacity(total);
+    let mut uvs = Vec::with_capacity(total);
+
+    for iz in 0..nz {
+        for ix in 0..nx {
+            let u = ix as f32 / cols as f32;
+            let v = iz as f32 / rows as f32;
+            let px = (u - 0.5) * width;
+            let pz = (v - 0.5) * depth;
+            let py = heights[iz * nx + ix];
+            positions.push([px, py, pz]);
+            uvs.push([u, v]);
+
+            let xm = ix.saturating_sub(1);
+            let xp = (ix + 1).min(cols);
+            let zm = iz.saturating_sub(1);
+            let zp = (iz + 1).min(rows);
+            let dhdx = (heights[iz * nx + xp] - heights[iz * nx + xm])
+                / ((xp - xm).max(1) as f32 * dx_step);
+            let dhdz = (heights[zp * nx + ix] - heights[zm * nx + ix])
+                / ((zp - zm).max(1) as f32 * dz_step);
+            let n = Vec3::new(-dhdx, 1.0, -dhdz).normalize();
+            normals.push([n.x, n.y, n.z]);
+        }
+    }
+
+    let mut indices = Vec::with_capacity(cols * rows * 6);
+    for iz in 0..rows as u32 {
+        for ix in 0..cols as u32 {
+            let a = iz * nx as u32 + ix;
+            let b = (iz + 1) * nx as u32 + ix;
+            let c = iz * nx as u32 + ix + 1;
+            let d = (iz + 1) * nx as u32 + ix + 1;
+            indices.extend_from_slice(&[a, b, c, c, b, d]);
+        }
+    }
+
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+        .with_generated_tangents()
+        .expect("drop cloth tangents")
+}
+
 fn spawn_drop_cloth_runner(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -914,18 +1068,11 @@ fn spawn_drop_cloth_runner(
         ..default()
     });
     // Spans X in [-1.42, +1.42], Z in [0.04, 0.72] — clears rail drag-chain (Z >= 0.7505) & rack feet (X <= -1.514)
-    let dc_mesh = meshes.add(
-        Plane3d::default()
-            .mesh()
-            .size(2.84, 0.68)
-            .build()
-            .with_generated_tangents()
-            .expect("drop cloth tangents"),
-    );
+    let dc_mesh = meshes.add(build_wrinkled_drop_cloth_mesh(2.84, 0.68, 48, 14));
     commands.spawn((
         Mesh3d(dc_mesh),
         MeshMaterial3d(dc_mat),
-        Transform::from_xyz(0.0, 0.0026, 0.38),
+        Transform::from_xyz(0.0, 0.0022, 0.38),
         NotShadowCaster,
     ));
 }
@@ -1272,7 +1419,7 @@ fn spawn_perimeter_workshop_props(
             ),
             (
                 Mesh3d(meshes.add(Cylinder::new(0.085, 0.22))),
-                MeshMaterial3d(dark_rubber_mat),
+                MeshMaterial3d(dark_rubber_mat.clone()),
                 Transform::from_xyz(0.0, 0.56, -0.05)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             ),
@@ -1319,6 +1466,341 @@ fn spawn_perimeter_workshop_props(
         Vec3::new(0.40, 0.30, 0.44),
         -0.10,
     );
+
+    // 5. Galvanized overhead spray-booth exhaust duct & extraction baffle hood (Y >= 2.95m, safely above canvas 2.30m)
+    let duct_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.66, 0.69, 0.73),
+        metallic: 0.88,
+        perceptual_roughness: 0.30,
+        clearcoat: 0.25,
+        clearcoat_perceptual_roughness: 0.28,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(0.15, 7.60))),
+        MeshMaterial3d(duct_mat.clone()),
+        Transform::from_xyz(0.0, 3.42, 0.22).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+    ));
+    let duct_ring_mesh = meshes.add(Cylinder::new(0.162, 0.028));
+    let strap_mesh = meshes.add(Cuboid::new(0.028, 0.78, 0.012));
+    for ix in -3..=3 {
+        let rx = ix as f32 * 1.15;
+        commands.spawn((
+            Mesh3d(duct_ring_mesh.clone()),
+            MeshMaterial3d(steel_struct_mat.clone()),
+            Transform::from_xyz(rx, 3.42, 0.22).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+        ));
+        commands.spawn((
+            Mesh3d(strap_mesh.clone()),
+            MeshMaterial3d(steel_struct_mat.clone()),
+            Transform::from_xyz(rx, 3.81, 0.22),
+        ));
+    }
+    // Baffle hood above mural centered at (0, 2.95, 0.16) + vertical collar up into duct
+    commands.spawn((
+        Transform::from_xyz(0.0, 2.95, 0.16),
+        Visibility::default(),
+        children![
+            (
+                Mesh3d(meshes.add(Cuboid::new(2.60, 0.045, 0.28))),
+                MeshMaterial3d(steel_struct_mat.clone()),
+                Transform::from_rotation(Quat::from_rotation_x(-0.22)),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(2.50, 0.018, 0.22))),
+                MeshMaterial3d(duct_mat.clone()),
+                Transform::from_xyz(0.0, 0.030, -0.02)
+                    .with_rotation(Quat::from_rotation_x(-0.22)),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.54, 0.44, 0.18))),
+                MeshMaterial3d(duct_mat.clone()),
+                Transform::from_xyz(-0.75, 0.24, 0.04),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.54, 0.44, 0.18))),
+                MeshMaterial3d(duct_mat.clone()),
+                Transform::from_xyz(0.75, 0.24, 0.04),
+            ),
+        ],
+    ));
+
+    // 6. Rolling industrial paint cart in left mid-ground (-2.95, 0.0, 0.68), yaw +0.22 rad (visible in Overview, clear of rack X >= -2.35)
+    let cart_red_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#8E241C").unwrap().into(),
+        metallic: 0.42,
+        perceptual_roughness: 0.36,
+        clearcoat: 0.48,
+        clearcoat_perceptual_roughness: 0.20,
+        ..default()
+    });
+    let rag_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#8A9BAE").unwrap().into(),
+        metallic: 0.0,
+        perceptual_roughness: 0.90,
+        ..default()
+    });
+    let pendant_screen_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#2892B8").unwrap().into(),
+        emissive: LinearRgba::new(0.18, 0.62, 0.85, 1.0),
+        unlit: true,
+        ..default()
+    });
+    let blue_tape_mat = materials.add(StandardMaterial {
+        base_color: Srgba::hex("#2063A8").unwrap().into(),
+        metallic: 0.02,
+        perceptual_roughness: 0.50,
+        ..default()
+    });
+    let caster_wheel = meshes.add(Cylinder::new(0.038, 0.024));
+    let leg_post = meshes.add(Cuboid::new(0.032, 0.72, 0.032));
+    let shelf_tray = meshes.add(Cuboid::new(0.64, 0.042, 0.42));
+    let can_cyl = meshes.add(Cylinder::new(0.0328, 0.120));
+    let can_label_cyl = meshes.add(Cylinder::new(0.0332, 0.062));
+    let can_bottom_rim = meshes.add(Cylinder::new(0.0330, 0.010));
+    let can_shoulder = meshes.add(
+        ConicalFrustum {
+            radius_top: 0.018,
+            radius_bottom: 0.0328,
+            height: 0.024,
+        }
+        .mesh()
+        .resolution(24),
+    );
+    let can_cap = meshes.add(Cylinder::new(0.020, 0.022));
+    let can_nozzle = meshes.add(Cylinder::new(0.0085, 0.016));
+    let cart_can_steel_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.76, 0.79, 0.83),
+        metallic: 0.90,
+        perceptual_roughness: 0.22,
+        ..default()
+    });
+    let cart_can_label_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.11, 0.12, 0.14),
+        metallic: 0.04,
+        perceptual_roughness: 0.52,
+        ..default()
+    });
+    let cart_nozzle_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.92, 0.92, 0.91),
+        metallic: 0.02,
+        perceptual_roughness: 0.42,
+        ..default()
+    });
+    let can_colors = [
+        Color::srgb(0.05, 0.72, 0.88),
+        Color::srgb(0.92, 0.38, 0.12),
+        Color::srgb(0.86, 0.18, 0.44),
+        Color::srgb(0.92, 0.74, 0.16),
+    ];
+    let can_mats: Vec<Handle<StandardMaterial>> = can_colors
+        .iter()
+        .map(|&col| {
+            materials.add(StandardMaterial {
+                base_color: col,
+                metallic: 0.12,
+                perceptual_roughness: 0.32,
+                clearcoat: 0.65,
+                clearcoat_perceptual_roughness: 0.18,
+                ..default()
+            })
+        })
+        .collect();
+    let cart_can_transforms = [
+        Transform::from_xyz(-0.18, 0.896, -0.06),
+        Transform::from_xyz(-0.10, 0.896, -0.08),
+        Transform::from_xyz(-0.14, 0.338, 0.02),
+        Transform::from_xyz(0.02, 0.852, 0.08)
+            .with_rotation(Quat::from_euler(EulerRot::YXZ, 0.48, FRAC_PI_2, 0.0)),
+    ];
+
+    commands.spawn((
+        Transform::from_xyz(-2.95, 0.0, 0.68).with_rotation(Quat::from_rotation_y(0.22)),
+        Visibility::default(),
+        children![
+            // 4 swivel casters
+            (
+                Mesh3d(caster_wheel.clone()),
+                MeshMaterial3d(dark_rubber_mat.clone()),
+                Transform::from_xyz(-0.27, 0.038, -0.16).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+            ),
+            (
+                Mesh3d(caster_wheel.clone()),
+                MeshMaterial3d(dark_rubber_mat.clone()),
+                Transform::from_xyz(0.27, 0.038, -0.16).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+            ),
+            (
+                Mesh3d(caster_wheel.clone()),
+                MeshMaterial3d(dark_rubber_mat.clone()),
+                Transform::from_xyz(-0.27, 0.038, 0.16).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+            ),
+            (
+                Mesh3d(caster_wheel),
+                MeshMaterial3d(dark_rubber_mat.clone()),
+                Transform::from_xyz(0.27, 0.038, 0.16).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
+            ),
+            // 4 upright angle legs
+            (
+                Mesh3d(leg_post.clone()),
+                MeshMaterial3d(cart_red_mat.clone()),
+                Transform::from_xyz(-0.29, 0.43, -0.18),
+            ),
+            (
+                Mesh3d(leg_post.clone()),
+                MeshMaterial3d(cart_red_mat.clone()),
+                Transform::from_xyz(0.29, 0.43, -0.18),
+            ),
+            (
+                Mesh3d(leg_post.clone()),
+                MeshMaterial3d(cart_red_mat.clone()),
+                Transform::from_xyz(-0.29, 0.43, 0.18),
+            ),
+            (
+                Mesh3d(leg_post),
+                MeshMaterial3d(cart_red_mat.clone()),
+                Transform::from_xyz(0.29, 0.43, 0.18),
+            ),
+            // Lower & upper steel trays + rubber mat on upper deck
+            (
+                Mesh3d(shelf_tray.clone()),
+                MeshMaterial3d(cart_red_mat.clone()),
+                Transform::from_xyz(0.0, 0.24, 0.0),
+            ),
+            (
+                Mesh3d(shelf_tray),
+                MeshMaterial3d(cart_red_mat),
+                Transform::from_xyz(0.0, 0.79, 0.0),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.58, 0.008, 0.36))),
+                MeshMaterial3d(dark_rubber_mat.clone()),
+                Transform::from_xyz(0.0, 0.815, 0.0),
+            ),
+            // Tubular push handle on right edge (+X)
+            (
+                Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
+                MeshMaterial3d(conduit_mat.clone()),
+                Transform::from_xyz(0.36, 0.84, 0.0).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+            ),
+            // 3 upright spare spray cans + 1 tipped on its side on top tray
+            (
+                cart_can_transforms[0],
+                Visibility::default(),
+                children![
+                    (Mesh3d(can_bottom_rim.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, -0.072, 0.0)),
+                    (Mesh3d(can_cyl.clone()), MeshMaterial3d(can_mats[0].clone()), Transform::from_xyz(0.0, -0.012, 0.0)),
+                    (Mesh3d(can_label_cyl.clone()), MeshMaterial3d(cart_can_label_mat.clone()), Transform::from_xyz(0.0, -0.016, 0.0)),
+                    (Mesh3d(can_shoulder.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, 0.060, 0.0)),
+                    (Mesh3d(can_cap.clone()), MeshMaterial3d(can_mats[0].clone()), Transform::from_xyz(0.0, 0.078, 0.0)),
+                    (Mesh3d(can_nozzle.clone()), MeshMaterial3d(cart_nozzle_mat.clone()), Transform::from_xyz(0.0, 0.092, 0.0)),
+                ],
+            ),
+            (
+                cart_can_transforms[1],
+                Visibility::default(),
+                children![
+                    (Mesh3d(can_bottom_rim.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, -0.072, 0.0)),
+                    (Mesh3d(can_cyl.clone()), MeshMaterial3d(can_mats[1].clone()), Transform::from_xyz(0.0, -0.012, 0.0)),
+                    (Mesh3d(can_label_cyl.clone()), MeshMaterial3d(cart_can_label_mat.clone()), Transform::from_xyz(0.0, -0.016, 0.0)),
+                    (Mesh3d(can_shoulder.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, 0.060, 0.0)),
+                    (Mesh3d(can_cap.clone()), MeshMaterial3d(can_mats[1].clone()), Transform::from_xyz(0.0, 0.078, 0.0)),
+                    (Mesh3d(can_nozzle.clone()), MeshMaterial3d(cart_nozzle_mat.clone()), Transform::from_xyz(0.0, 0.092, 0.0)),
+                ],
+            ),
+            (
+                cart_can_transforms[2],
+                Visibility::default(),
+                children![
+                    (Mesh3d(can_bottom_rim.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, -0.072, 0.0)),
+                    (Mesh3d(can_cyl.clone()), MeshMaterial3d(can_mats[2].clone()), Transform::from_xyz(0.0, -0.012, 0.0)),
+                    (Mesh3d(can_label_cyl.clone()), MeshMaterial3d(cart_can_label_mat.clone()), Transform::from_xyz(0.0, -0.016, 0.0)),
+                    (Mesh3d(can_shoulder.clone()), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, 0.060, 0.0)),
+                    (Mesh3d(can_cap.clone()), MeshMaterial3d(can_mats[2].clone()), Transform::from_xyz(0.0, 0.078, 0.0)),
+                    (Mesh3d(can_nozzle.clone()), MeshMaterial3d(cart_nozzle_mat.clone()), Transform::from_xyz(0.0, 0.092, 0.0)),
+                ],
+            ),
+            (
+                cart_can_transforms[3],
+                Visibility::default(),
+                children![
+                    (Mesh3d(can_bottom_rim), MeshMaterial3d(cart_can_steel_mat.clone()), Transform::from_xyz(0.0, -0.072, 0.0)),
+                    (Mesh3d(can_cyl), MeshMaterial3d(can_mats[3].clone()), Transform::from_xyz(0.0, -0.012, 0.0)),
+                    (Mesh3d(can_label_cyl), MeshMaterial3d(cart_can_label_mat), Transform::from_xyz(0.0, -0.016, 0.0)),
+                    (Mesh3d(can_shoulder), MeshMaterial3d(cart_can_steel_mat), Transform::from_xyz(0.0, 0.060, 0.0)),
+                    (Mesh3d(can_cap), MeshMaterial3d(can_mats[3].clone()), Transform::from_xyz(0.0, 0.078, 0.0)),
+                    (Mesh3d(can_nozzle), MeshMaterial3d(cart_nozzle_mat), Transform::from_xyz(0.0, 0.092, 0.0)),
+                ],
+            ),
+            // Roll of blue painter's tape
+            (
+                Mesh3d(meshes.add(
+                    Torus {
+                        minor_radius: 0.016,
+                        major_radius: 0.044,
+                    }
+                    .mesh()
+                    .minor_resolution(12)
+                    .major_resolution(24)
+                    .build(),
+                )),
+                MeshMaterial3d(blue_tape_mat),
+                Transform::from_xyz(0.16, 0.835, -0.07),
+            ),
+            // Folded shop rag
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.16, 0.018, 0.12))),
+                MeshMaterial3d(rag_mat),
+                Transform::from_xyz(0.18, 0.828, 0.08).with_rotation(Quat::from_rotation_y(-0.35)),
+            ),
+            // Handheld teach pendant + coiled cord on front shelf edge
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.11, 0.024, 0.16))),
+                MeshMaterial3d(panel_grey_mat.clone()),
+                Transform::from_xyz(-0.02, 0.830, -0.10).with_rotation(Quat::from_rotation_y(0.18)),
+            ),
+            (
+                Mesh3d(meshes.add(Cuboid::new(0.082, 0.004, 0.068))),
+                MeshMaterial3d(pendant_screen_mat),
+                Transform::from_xyz(-0.02, 0.842, -0.105).with_rotation(Quat::from_rotation_y(0.18)),
+            ),
+        ],
+    ));
+
+    // 7. Draped static pneumatic supply hose routed cleanly behind cart & rack along left/back wall
+    //    and armored cable feed (right rail junction -> rail drag-chain anchor)
+    commands.spawn((
+        Mesh3d(meshes.add(build_static_hose_tube_mesh(
+            Vec3::new(-3.31, 0.49, 1.84),
+            Vec3::new(0.05, -0.55, -0.75),
+            Vec3::new(-3.72, 0.08, 0.08),
+            Vec3::new(-0.15, -0.10, -1.20),
+            0.0095,
+            18,
+        ))),
+        MeshMaterial3d(hose_orange_mat.clone()),
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(build_static_hose_tube_mesh(
+            Vec3::new(-3.72, 0.08, 0.08),
+            Vec3::new(0.75, 0.15, -0.15),
+            Vec3::new(-2.75, 1.41, -0.005),
+            Vec3::new(0.10, 1.15, -0.05),
+            0.0095,
+            18,
+        ))),
+        MeshMaterial3d(hose_orange_mat),
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(build_static_hose_tube_mesh(
+            Vec3::new(1.81, 0.042, 0.78),
+            Vec3::new(-0.18, 0.06, 0.0),
+            Vec3::new(1.68, 0.065, 0.778),
+            Vec3::new(-0.18, 0.0, 0.0),
+            0.0115,
+            10,
+        ))),
+        MeshMaterial3d(dark_rubber_mat),
+    ));
 }
 
 fn spawn_taped_carton(
@@ -1363,6 +1845,7 @@ fn spawn_studio_lights(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    images: &mut ResMut<Assets<Image>>,
 ) {
     // Balanced studio ambient bounce (54.0) for rich shadow depth & readable dark steel details
     commands.insert_resource(GlobalAmbientLight {
@@ -1371,7 +1854,21 @@ fn spawn_studio_lights(
         affects_lightmapped_meshes: true,
     });
 
-    // Cool overhead daylight skylight directional light casting crisp soft PCF shadows
+    // Subtle volumetric room haze volume (strictly crisp low density so canvas artwork never washes out)
+    commands.spawn((
+        FogVolume {
+            fog_color: Color::srgb(0.88, 0.91, 0.96),
+            density_factor: 0.010,
+            absorption: 0.06,
+            scattering: 0.25,
+            scattering_asymmetry: 0.65,
+            light_intensity: 0.85,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 2.35, 2.60).with_scale(Vec3::new(8.2, 4.4, 6.8)),
+    ));
+
+    // Cool overhead daylight skylight directional light casting crisp soft PCF shadows & subtle volumetric shafts
     commands.spawn((
         DirectionalLight {
             illuminance: 2_350.0,
@@ -1379,6 +1876,7 @@ fn spawn_studio_lights(
             shadow_maps_enabled: true,
             ..default()
         },
+        VolumetricLight,
         Transform::from_xyz(2.0, 5.5, 4.2).looking_at(Vec3::new(-0.3, 1.2, 0.4), Vec3::Y),
         CascadeShadowConfigBuilder {
             first_cascade_far_bound: 5.0,
@@ -1412,8 +1910,39 @@ fn spawn_studio_lights(
         unlit: true,
         ..default()
     });
+
+    let shaft_tex = images.add(build_light_shaft_texture(64, 128));
+    let neutral_shaft_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.98, 0.95, 0.032),
+        base_color_texture: Some(shaft_tex.clone()),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    let cool_shaft_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.84, 0.92, 1.0, 0.034),
+        base_color_texture: Some(shaft_tex.clone()),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    let warm_shaft_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.78, 0.50, 0.042),
+        base_color_texture: Some(shaft_tex),
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+
     let can_mesh = meshes.add(Cylinder::new(0.085, 0.22));
     let lens_mesh = meshes.add(Cylinder::new(0.072, 0.015));
+    let shaft_mesh = meshes.add(make_open_cone_mesh(0.082, 0.56, 1.90, 32));
 
     // Spotlight 1: Neutral gallery key aimed cleanly at the wall canvas for accurate paint color
     commands.spawn((
@@ -1440,6 +1969,14 @@ fn spawn_studio_lights(
                 Transform::from_xyz(0.0, 0.0, -0.105)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
                 NotShadowCaster,
+            ),
+            (
+                Mesh3d(shaft_mesh.clone()),
+                MeshMaterial3d(neutral_shaft_mat),
+                Transform::from_xyz(0.0, 0.0, -1.06)
+                    .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                NotShadowCaster,
+                NotShadowReceiver,
             ),
         ],
     ));
@@ -1470,6 +2007,14 @@ fn spawn_studio_lights(
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
                 NotShadowCaster,
             ),
+            (
+                Mesh3d(shaft_mesh.clone()),
+                MeshMaterial3d(cool_shaft_mat),
+                Transform::from_xyz(0.0, 0.0, -1.06)
+                    .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                NotShadowCaster,
+                NotShadowReceiver,
+            ),
         ],
     ));
 
@@ -1498,6 +2043,14 @@ fn spawn_studio_lights(
                 Transform::from_xyz(0.0, 0.0, -0.105)
                     .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
                 NotShadowCaster,
+            ),
+            (
+                Mesh3d(shaft_mesh),
+                MeshMaterial3d(warm_shaft_mat),
+                Transform::from_xyz(0.0, 0.0, -1.06)
+                    .with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                NotShadowCaster,
+                NotShadowReceiver,
             ),
         ],
     ));
@@ -1672,8 +2225,9 @@ fn build_concrete_floor_textures(size: u32) -> (Image, Image, Image) {
             albedo.push(255);
 
             // Roughness in Green channel (glTF/Bevy metallic-roughness convention: G = roughness, B = metallic)
-            let r_val = (0.56 + 0.22 * scuff + 0.14 * micro_n + 0.20 * seam - 0.12 * deposit)
-                .clamp(0.36, 0.94);
+            // Sealed studio floor: smooth epoxy sheen (~0.34..0.52) on intact concrete, matte in scuffs & seams
+            let r_val = (0.40 + 0.24 * scuff + 0.14 * micro_n + 0.20 * seam - 0.12 * deposit)
+                .clamp(0.32, 0.88);
             let r_u8 = (r_val * 255.0).round() as u8;
             rough.extend_from_slice(&[0, r_u8, 0, 255]);
 
@@ -1887,64 +2441,341 @@ fn build_ceiling_deck_textures(size: u32) -> (Image, Image, Image) {
     )
 }
 
-fn build_industrial_wall_textures(size: u32) -> (Image, Image) {
-    let n = (size * size) as usize;
+fn build_industrial_wall_textures(width: u32, height: u32) -> (Image, Image, Image) {
+    let n = (width * height) as usize;
     let mut albedo = Vec::with_capacity(n * 4);
+    let mut rough_metal = Vec::with_capacity(n * 4);
     let mut heights = vec![0.0_f32; n];
 
     let cols = 16.0_f32;
-    let rows = 20.0_f32;
+    let rows = 21.0_f32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let u = x as f32 / width as f32;
+            let v = y as f32 / height as f32;
+            // World coordinates spanning back wall: X in [-4.0, +4.0], Y in [0.0, 4.2]
+            let wx = (u - 0.5) * 8.0;
+            let wy = (1.0 - v) * 4.2;
+
+            // Organic mortar line warp + chipped CMU block imperfections
+            let warp_u = (fbm(wx * 3.8, wy * 3.8, 311) - 0.5) * 0.045;
+            let warp_v = (fbm(wx * 4.2 + 5.1, wy * 4.2, 317) - 0.5) * 0.055;
+            let cu = u * cols + warp_u;
+            let rv = v * rows + warp_v;
+
+            let row_idx = rv.floor();
+            let row_f = rv.fract();
+            let stagger = if (row_idx as i32).rem_euclid(2) == 0 { 0.0 } else { 0.5 };
+            let col_idx = (cu + stagger).floor();
+            let col_f = (cu + stagger).fract();
+
+            let chip_n = fbm(wx * 14.0, wy * 14.0, 331);
+            let mortar_thick_v = 0.068 + 0.028 * (chip_n - 0.5);
+            let mortar_thick_u = 0.032 + 0.018 * (chip_n - 0.5);
+            let mortar = row_f < mortar_thick_v
+                || row_f > (1.0 - mortar_thick_v)
+                || col_f < mortar_thick_u
+                || col_f > (1.0 - mortar_thick_u);
+
+            let block_id = (col_idx as i32).wrapping_mul(37) + (row_idx as i32).wrapping_mul(19);
+            let block_tint = hash2(block_id, 5, 777) * 0.065;
+            let aggregate = fbm(wx * 18.0, wy * 18.0, 349);
+            let micro_pit = fbm(wx * 52.0, wy * 52.0, 353);
+            let paint_patch = fbm(wx * 0.75 + 2.3, wy * 0.65 - 1.1, 367);
+
+            // Lower-wall concrete floor kickup dust & faint vertical ceiling moisture streaks
+            let low_grime = (1.0 - wy / 0.85).clamp(0.0, 1.0).powf(1.6) * (0.045 + 0.035 * aggregate);
+            let streak = (fbm(wx * 2.4, wy * 0.35, 383) - 0.56).clamp(0.0, 1.0)
+                * (1.0 - wy / 4.2).clamp(0.2, 1.0)
+                * 0.14;
+
+            let base_luma = if mortar {
+                0.21 + 0.045 * micro_pit - 0.025 * low_grime
+            } else {
+                0.275 + block_tint + 0.06 * aggregate + 0.04 * paint_patch - low_grime - streak
+            };
+
+            let warm_cool = 0.012 * (hash2(block_id, 11, 797) - 0.5);
+            let mut rgb = [
+                (base_luma * (1.01 + warm_cool)).clamp(0.11, 0.50),
+                (base_luma * 1.00).clamp(0.11, 0.50),
+                (base_luma * (1.03 - warm_cool)).clamp(0.11, 0.50),
+            ];
+
+            // Subtle dried studio overspray halo drifting just outside canvas frame perimeter
+            let dx_edge = (wx.abs() - 1.25).clamp(0.0, 0.45);
+            let outside_y = if wy < 0.80 {
+                0.80 - wy
+            } else if wy > 2.30 {
+                wy - 2.30
+            } else {
+                0.0
+            };
+            let rim_dist = (dx_edge * dx_edge + outside_y * outside_y).sqrt();
+            let halo_band = if (wx.abs() > 1.20 || wy < 0.84 || wy > 2.26) && rim_dist < 0.34 {
+                ((1.0 - rim_dist / 0.34).clamp(0.0, 1.0)).powf(2.0)
+            } else {
+                0.0
+            };
+            let mut mist_w = 0.0_f32;
+            if halo_band > 0.02 {
+                let mist_mix = fbm(wx * 4.5, wy * 4.5, 409);
+                mist_w = (halo_band * mist_mix * 0.42).clamp(0.0, 0.24);
+                let ghost_col = if wx < 0.0 {
+                    [0.14, 0.52, 0.68]
+                } else {
+                    [0.72, 0.30, 0.26]
+                };
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * (1.0 - mist_w) + ghost_col[c] * mist_w;
+                }
+            }
+
+            albedo.push((rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8);
+            albedo.push((rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8);
+            albedo.push((rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8);
+            albedo.push(255);
+
+            // Chalky matte mortar (0.93) vs subtly satin roller-painted CMU blocks (0.68..0.85)
+            let rough = if mortar {
+                (0.92 + 0.04 * micro_pit).clamp(0.86, 0.97)
+            } else {
+                (0.70 + 0.14 * (1.0 - paint_patch) + 0.08 * micro_pit + 0.08 * mist_w)
+                    .clamp(0.64, 0.92)
+            };
+            rough_metal.extend_from_slice(&[0, (rough * 255.0).round() as u8, 4, 255]);
+
+            heights[(y * width + x) as usize] = if mortar {
+                -0.55 + micro_pit * 0.15
+            } else {
+                aggregate * 0.35 + micro_pit * 0.35 - chip_n * 0.10
+            };
+        }
+    }
+
+    let normal = normal_map_from_heights_rect(&heights, width, height, 2.4);
+    (
+        create_rgba8_image(width, height, albedo, TextureFormat::Rgba8UnormSrgb),
+        create_rgba8_image(width, height, rough_metal, TextureFormat::Rgba8Unorm),
+        create_rgba8_image(width, height, normal, TextureFormat::Rgba8Unorm),
+    )
+}
+
+fn build_wood_grain_textures(size: u32) -> (Image, Image, Image) {
+    let n = (size * size) as usize;
+    let mut albedo = Vec::with_capacity(n * 4);
+    let mut rough_metal = Vec::with_capacity(n * 4);
+    let mut heights = vec![0.0_f32; n];
 
     for y in 0..size {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
+            let warp = fbm(u * 4.5, v * 1.4, 811) * 0.25;
+            let ring_coord = (v * 14.0 + warp * 12.0 + fbm(u * 12.0, v * 3.0, 823) * 2.5) * PI;
+            let ring = ring_coord.sin() * 0.5 + 0.5;
+            let fiber = value_noise(u * 120.0, v * 28.0, 829);
 
-            let row_idx = (v * rows).floor();
-            let row_f = (v * rows).fract();
-            let stagger = if (row_idx as i32) % 2 == 0 { 0.0 } else { 0.5 };
-            let col_f = (u * cols + stagger).fract();
+            let knot_d = (((u - 0.62) * 3.2).powi(2) + ((v - 0.42) * 8.0).powi(2)).sqrt();
+            let knot = (1.0 - (knot_d / 0.28).clamp(0.0, 1.0)).powi(2);
 
-            let mortar = row_f < 0.07 || row_f > 0.93 || col_f < 0.035 || col_f > 0.965;
-            let block_id = ((u * cols + stagger).floor() as i32) * 31 + (row_idx as i32) * 17;
-            let block_tint = hash2(block_id, 5, 777) * 0.05;
-            let grit = fbm(u * 36.0, v * 36.0, 313);
+            let luma = (0.58 + 0.12 * ring + 0.05 * fiber - 0.22 * knot).clamp(0.24, 0.80);
+            albedo.extend_from_slice(&[
+                (luma * 1.12 * 255.0).round().clamp(0.0, 255.0) as u8,
+                (luma * 0.86 * 255.0).round().clamp(0.0, 255.0) as u8,
+                (luma * 0.56 * 255.0).round().clamp(0.0, 255.0) as u8,
+                255,
+            ]);
 
-            let base = if mortar {
-                0.20 + 0.04 * grit
-            } else {
-                0.26 + block_tint + 0.07 * grit
-            };
-
-            let r = (base * 1.02 * 255.0).clamp(0.0, 255.0) as u8;
-            let g = (base * 1.00 * 255.0).clamp(0.0, 255.0) as u8;
-            let b = (base * 1.03 * 255.0).clamp(0.0, 255.0) as u8;
-            albedo.extend_from_slice(&[r, g, b, 255]);
-
-            heights[(y * size + x) as usize] = if mortar { -0.45 } else { grit * 0.45 };
+            let rough = (0.68 + 0.14 * (1.0 - ring) + 0.08 * knot).clamp(0.55, 0.90);
+            rough_metal.extend_from_slice(&[0, (rough * 255.0).round() as u8, 0, 255]);
+            heights[(y * size + x) as usize] = ring * 0.55 + fiber * 0.35 - knot * 0.45;
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, 2.2);
+    let normal = normal_map_from_heights(&heights, size, 1.5);
     (
         create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
+        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
         create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
     )
 }
 
+fn build_light_shaft_texture(width: u32, height: u32) -> Image {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let v = y as f32 / (height.saturating_sub(1).max(1)) as f32;
+        // Soft entrance near lens (v -> 0) and smooth feather to 0 well before beam end (v -> 1)
+        let axial = (v / 0.14).clamp(0.0, 1.0) * (1.0 - v).powf(2.2);
+        for x in 0..width {
+            let u = x as f32 / width as f32;
+            let streaks = 0.86 + 0.14 * (u * 10.0 * PI).sin();
+            let alpha = (axial * streaks).clamp(0.0, 1.0);
+            data.extend_from_slice(&[255, 255, 255, (alpha * 255.0).round() as u8]);
+        }
+    }
+    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+}
+
+/// Builds an open-ended frustum mesh (`y = +height/2` at `r_top`, `y = -height/2` at `r_bot`)
+/// with UVs `(u, v = 0 at top -> 1 at bottom)` for feathered volumetric spotlight cones.
+fn make_open_cone_mesh(r_top: f32, r_bot: f32, height: f32, segments: usize) -> Mesh {
+    let segs = segments.max(8);
+    let mut positions = Vec::with_capacity((segs + 1) * 2);
+    let mut normals = Vec::with_capacity((segs + 1) * 2);
+    let mut uvs = Vec::with_capacity((segs + 1) * 2);
+    let mut indices = Vec::with_capacity(segs * 6);
+
+    let y_top = height * 0.5;
+    let y_bot = -height * 0.5;
+    let slope = (r_bot - r_top) / height.max(1e-4);
+
+    for i in 0..=segs {
+        let u = i as f32 / segs as f32;
+        let theta = u * 2.0 * PI;
+        let (st, ct) = theta.sin_cos();
+        let n = Vec3::new(ct, slope, st).normalize();
+
+        positions.push([r_top * ct, y_top, r_top * st]);
+        normals.push([n.x, n.y, n.z]);
+        uvs.push([u, 0.0]);
+
+        positions.push([r_bot * ct, y_bot, r_bot * st]);
+        normals.push([n.x, n.y, n.z]);
+        uvs.push([u, 1.0]);
+    }
+
+    for i in 0..segs as u32 {
+        let a = i * 2;
+        let b = a + 1;
+        let c = a + 2;
+        let d = a + 3;
+        indices.extend_from_slice(&[a, b, c, c, b, d]);
+    }
+
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
+fn build_static_hose_tube_mesh(
+    p0: Vec3,
+    m0: Vec3,
+    p1: Vec3,
+    m1: Vec3,
+    radius: f32,
+    rings: usize,
+) -> Mesh {
+    const SIDES: usize = 10;
+    let rings = rings.max(4);
+    let mut pts = Vec::with_capacity(rings);
+    for i in 0..rings {
+        let t = i as f32 / (rings - 1) as f32;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let mut pt = p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11;
+        pt.y = pt.y.max(radius + 0.004);
+        pts.push(pt);
+    }
+
+    let mut positions = Vec::with_capacity(rings * (SIDES + 1));
+    let mut normals = Vec::with_capacity(rings * (SIDES + 1));
+    let mut uvs = Vec::with_capacity(rings * (SIDES + 1));
+    let mut indices = Vec::with_capacity((rings - 1) * SIDES * 6);
+
+    let mut tangents = Vec::with_capacity(rings);
+    for i in 0..rings {
+        let t = if i == 0 {
+            (pts[1] - pts[0]).normalize_or(Vec3::Y)
+        } else if i + 1 == rings {
+            (pts[i] - pts[i - 1]).normalize_or(Vec3::Y)
+        } else {
+            (pts[i + 1] - pts[i - 1]).normalize_or(Vec3::Y)
+        };
+        tangents.push(t);
+    }
+
+    let t0 = tangents[0];
+    let hint = if t0.dot(Vec3::X).abs() < 0.85 {
+        Vec3::X
+    } else {
+        Vec3::Z
+    };
+    let mut u_ax = (hint - t0 * hint.dot(t0)).normalize_or(Vec3::Z);
+
+    for i in 0..rings {
+        let ti = tangents[i];
+        if i > 0 {
+            let t_prev = tangents[i - 1];
+            if t_prev.dot(ti) > -0.9999 {
+                u_ax = Quat::from_rotation_arc(t_prev, ti) * u_ax;
+            }
+            u_ax = (u_ax - ti * u_ax.dot(ti)).normalize_or(Vec3::X);
+        }
+        let v_ax = ti.cross(u_ax).normalize_or(Vec3::Z);
+        let v = i as f32 / (rings - 1) as f32;
+
+        for j in 0..=SIDES {
+            let u = j as f32 / SIDES as f32;
+            let (st, ct) = (u * 2.0 * PI).sin_cos();
+            let n = (u_ax * ct + v_ax * st).normalize();
+            let p = pts[i] + n * radius;
+            positions.push([p.x, p.y, p.z]);
+            normals.push([n.x, n.y, n.z]);
+            uvs.push([u, v]);
+        }
+    }
+
+    let stride = (SIDES + 1) as u32;
+    for i in 0..(rings - 1) as u32 {
+        let r0 = i * stride;
+        let r1 = (i + 1) * stride;
+        for j in 0..SIDES as u32 {
+            let a = r0 + j;
+            let b = r1 + j;
+            let c = r0 + j + 1;
+            let d = r1 + j + 1;
+            indices.extend_from_slice(&[a, c, b, c, d, b]);
+        }
+    }
+
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
+}
+
 fn normal_map_from_heights(heights: &[f32], size: u32, strength: f32) -> Vec<u8> {
-    let mut out = Vec::with_capacity((size * size * 4) as usize);
-    let s = size as i32;
-    for y in 0..s {
-        for x in 0..s {
-            let xm = (x - 1).rem_euclid(s) as usize;
-            let xp = (x + 1).rem_euclid(s) as usize;
-            let ym = (y - 1).rem_euclid(s) as usize;
-            let yp = (y + 1).rem_euclid(s) as usize;
-            let row = y as usize * size as usize;
+    normal_map_from_heights_rect(heights, size, size, strength)
+}
+
+fn normal_map_from_heights_rect(
+    heights: &[f32],
+    width: u32,
+    height: u32,
+    strength: f32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity((width * height * 4) as usize);
+    let w = width as i32;
+    let h = height as i32;
+    for y in 0..h {
+        for x in 0..w {
+            let xm = (x - 1).rem_euclid(w) as usize;
+            let xp = (x + 1).rem_euclid(w) as usize;
+            let ym = (y - 1).rem_euclid(h) as usize;
+            let yp = (y + 1).rem_euclid(h) as usize;
+            let row = y as usize * width as usize;
             let dx = heights[row + xp] - heights[row + xm];
-            let dy = heights[yp * size as usize + x as usize]
-                - heights[ym * size as usize + x as usize];
+            let dy = heights[yp * width as usize + x as usize]
+                - heights[ym * width as usize + x as usize];
             let n = Vec3::new(-dx * strength, -dy * strength, 1.0).normalize();
             out.push(((n.x * 0.5 + 0.5) * 255.0).round() as u8);
             out.push(((n.y * 0.5 + 0.5) * 255.0).round() as u8);
@@ -2152,6 +2983,32 @@ mod tests {
         assert_eq!(ceil_a.texture_descriptor.size.width, 64);
         assert_eq!(ceil_r.texture_descriptor.size.height, 64);
         assert_eq!(ceil_n.texture_descriptor.size.width, 64);
+
+        let (wall_a, wall_rm, wall_wn) = build_industrial_wall_textures(128, 64);
+        assert_eq!(wall_a.texture_descriptor.size.width, 128);
+        assert_eq!(wall_rm.texture_descriptor.size.height, 64);
+        assert_eq!(wall_wn.texture_descriptor.size.width, 128);
+
+        let (wood_a, wood_r, wood_n) = build_wood_grain_textures(64);
+        assert_eq!(wood_a.texture_descriptor.size.width, 64);
+        assert_eq!(wood_r.texture_descriptor.size.height, 64);
+        assert_eq!(wood_n.texture_descriptor.size.width, 64);
+
+        let shaft = build_light_shaft_texture(32, 64);
+        assert_eq!(shaft.texture_descriptor.size.width, 32);
+        assert_eq!(shaft.texture_descriptor.size.height, 64);
+
+        let dc_mesh = build_wrinkled_drop_cloth_mesh(2.84, 0.68, 24, 8);
+        let pos_attr = dc_mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .expect("drop cloth positions");
+        if let bevy::mesh::VertexAttributeValues::Float32x3(pts) = pos_attr {
+            // Perimeter border vertices stay flush at y == 0 while interior wrinkles gently
+            assert!(pts[0][1].abs() < 1e-6);
+            assert!(pts.iter().any(|p| p[1] > 0.0005 && p[1] < 0.01));
+        } else {
+            panic!("expected Float32x3 positions");
+        }
 
         // Overspray patina deposits subtly under canvas & rack without altering far floor
         let (_, dep_canvas) = sample_overspray_patina(0.18, 0.14, [0.3, 0.3, 0.3]);

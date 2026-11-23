@@ -23,6 +23,9 @@ const MAX_SPAWNS_PER_FRAME: usize = 16;
 /// Quadratic aerodynamic drag coefficient for mist puffs in air.
 const AIR_DRAG_COEFF: f32 = 6.5;
 
+/// Maximum pre-allocated ambient studio dust mote billboards in the pool.
+const DUST_MOTE_POOL_SIZE: usize = 48;
+
 /// Registers the volumetric aerosol mist cone billboard FX systems.
 pub fn plugin(app: &mut App) {
     app.add_systems(Startup, setup_mist)
@@ -51,6 +54,17 @@ struct MistParticle {
     base_alpha: f32,
     roll: f32,
     roll_vel: f32,
+    mat_handle: Handle<StandardMaterial>,
+}
+
+#[derive(Component)]
+struct DustMote {
+    base_pos: Vec3,
+    amp: Vec3,
+    freq: Vec3,
+    phase: f32,
+    size: f32,
+    base_alpha: f32,
     mat_handle: Handle<StandardMaterial>,
 }
 
@@ -141,8 +155,56 @@ fn setup_mist(
         cursor: 0,
         entities,
     });
+
+    // Deterministic pool of subtle floating dust motes catching studio light cones
+    let mut dust_rng = DeterministicRng::new(app_config.cli.seed.wrapping_add(7331));
+    for _ in 0..DUST_MOTE_POOL_SIZE {
+        let base_alpha = dust_rng.range(0.04, 0.11);
+        let mat_handle = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.96, 0.90, base_alpha),
+            base_color_texture: Some(mist_tex.clone()),
+            alpha_mode: AlphaMode::Add,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        });
+        let base_pos = Vec3::new(
+            dust_rng.range(-2.6, 2.2),
+            dust_rng.range(1.1, 3.3),
+            dust_rng.range(0.45, 2.8),
+        );
+        let size = dust_rng.range(0.005, 0.009);
+        commands.spawn((
+            Name::new("StudioDustMote"),
+            Mesh3d(quad_mesh.clone()),
+            MeshMaterial3d(mat_handle.clone()),
+            Transform::from_translation(base_pos).with_scale(Vec3::splat(size)),
+            Visibility::Inherited,
+            NotShadowCaster,
+            NotShadowReceiver,
+            DustMote {
+                base_pos,
+                amp: Vec3::new(
+                    dust_rng.range(0.03, 0.09),
+                    dust_rng.range(0.02, 0.07),
+                    dust_rng.range(0.03, 0.08),
+                ),
+                freq: Vec3::new(
+                    dust_rng.range(0.08, 0.22),
+                    dust_rng.range(0.06, 0.18),
+                    dust_rng.range(0.07, 0.20),
+                ),
+                phase: dust_rng.range(0.0, 2.0 * PI),
+                size,
+                base_alpha,
+                mat_handle,
+            },
+        ));
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_mist(
     clock: Res<SimClock>,
     spray_job: Res<SprayJobRes>,
@@ -150,8 +212,32 @@ fn update_mist(
     mut mist_state: ResMut<MistState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     camera_q: Query<&GlobalTransform, With<Camera3d>>,
-    mut particle_q: Query<(&mut MistParticle, &mut Transform, &mut Visibility)>,
+    mut particle_q: Query<(&mut MistParticle, &mut Transform, &mut Visibility), Without<DustMote>>,
+    mut dust_q: Query<(&DustMote, &mut Transform), Without<MistParticle>>,
 ) {
+    let t_sim_f32 = clock.t_sim as f32;
+    let cam_rot = camera_q
+        .iter()
+        .next()
+        .map(|gtf| gtf.to_scale_rotation_translation().1)
+        .unwrap_or(Quat::IDENTITY);
+
+    for (mote, mut tf) in &mut dust_q {
+        let p = mote.phase;
+        let offset = Vec3::new(
+            (t_sim_f32 * mote.freq.x + p).sin() * mote.amp.x,
+            (t_sim_f32 * mote.freq.y + p * 1.37).cos() * mote.amp.y,
+            (t_sim_f32 * mote.freq.z + p * 0.71).sin() * mote.amp.z,
+        );
+        tf.translation = mote.base_pos + offset;
+        tf.rotation = cam_rot;
+        tf.scale = Vec3::splat(mote.size);
+        let glint = 0.65 + 0.35 * (t_sim_f32 * 0.55 + p * 2.1).sin();
+        if let Some(mut mat) = materials.get_mut(&mote.mat_handle) {
+            mat.base_color = Color::srgba(1.0, 0.96, 0.90, mote.base_alpha * glint);
+        }
+    }
+
     if clock.reset_epoch != mist_state.last_reset_epoch {
         mist_state.last_reset_epoch = clock.reset_epoch;
         mist_state.spawn_accum = 0.0;
@@ -163,11 +249,6 @@ fn update_mist(
     }
 
     let dt_sim = (clock.t_sim - clock.prev_t_sim).max(0.0) as f32;
-    let cam_rot = camera_q
-        .iter()
-        .next()
-        .map(|gtf| gtf.to_scale_rotation_translation().1)
-        .unwrap_or(Quat::IDENTITY);
     let wall_z = app_config.studio.canvas_center.z + 0.008;
 
     // 1. Advance active mist particles
