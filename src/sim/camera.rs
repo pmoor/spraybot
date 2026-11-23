@@ -3,13 +3,20 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use bevy::{
     anti_alias::smaa::Smaa,
     app::AppExit,
-    camera::{Hdr, RenderTarget},
-    core_pipeline::tonemapping::Tonemapping,
+    camera::{Hdr, RenderTarget, ShadowLodOrigin},
+    core_pipeline::{
+        prepass::{DeferredPrepass, DepthPrepass},
+        tonemapping::Tonemapping,
+    },
     input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
+    light::VolumetricFog,
     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel},
-    post_process::bloom::Bloom,
+    post_process::{
+        bloom::Bloom,
+        dof::{DepthOfField, DepthOfFieldMode},
+    },
     prelude::*,
-    render::view::Msaa,
+    render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, Msaa},
 };
 
 use crate::cli::CameraPreset;
@@ -144,6 +151,30 @@ pub fn plugin(app: &mut App) {
         );
 }
 
+/// Returns photographic DepthOfField settings appropriate for the active camera preset,
+/// keeping `Canvas` completely crisp edge-to-edge (`None`).
+fn dof_for_preset(preset: Option<CameraPreset>, distance: f32) -> Option<DepthOfField> {
+    match preset {
+        Some(CameraPreset::Canvas) => None,
+        Some(CameraPreset::Follow) | Some(CameraPreset::Rack) => Some(DepthOfField {
+            mode: DepthOfFieldMode::Gaussian,
+            focal_distance: distance.max(0.45),
+            sensor_height: 0.01866,
+            aperture_f_stops: 5.6,
+            max_circle_of_confusion_diameter: 9.0,
+            max_depth: 12.0,
+        }),
+        Some(CameraPreset::Overview) | None => Some(DepthOfField {
+            mode: DepthOfFieldMode::Gaussian,
+            focal_distance: distance.max(0.6),
+            sensor_height: 0.01866,
+            aperture_f_stops: 11.0,
+            max_circle_of_confusion_diameter: 4.0,
+            max_depth: 14.0,
+        }),
+    }
+}
+
 fn spawn_camera(
     mut commands: Commands,
     app_config: Res<AppConfig>,
@@ -159,21 +190,55 @@ fn spawn_camera(
     bloom.low_frequency_boost = 0.45;
     bloom.high_pass_frequency = 0.90;
 
+    let color_grading = ColorGrading {
+        global: ColorGradingGlobal {
+            exposure: 0.04,
+            post_saturation: 1.03,
+            ..default()
+        },
+        shadows: ColorGradingSection {
+            contrast: 1.01,
+            ..default()
+        },
+        highlights: ColorGradingSection {
+            gamma: 0.98,
+            ..default()
+        },
+        ..default()
+    };
+
     let mut entity = commands.spawn((
         MainStudioCamera,
         Camera3d::default(),
+        ShadowLodOrigin,
         Hdr,
         Msaa::Off,
+        DepthPrepass,
+        DeferredPrepass,
         Smaa::default(),
         ScreenSpaceAmbientOcclusion {
             quality_level: ScreenSpaceAmbientOcclusionQualityLevel::High,
             radius: 0.30,
             constant_object_thickness: 0.08,
         },
+        // Deferred prepass keeps Bevy 0.20.1 clearcoat normals intact alongside `SSAO`
+        // (`NormalPrepass`), while omitting `ScreenSpaceReflections` prevents stochastic static
+        // reflection flicker (`GeneratedEnvironmentMapLight` + PBR lights drive reflections).
+        VolumetricFog {
+            ambient_color: Color::srgb(0.86, 0.90, 0.96),
+            ambient_intensity: 0.02,
+            step_count: 48,
+            jitter: 0.0,
+        },
         Tonemapping::AcesFitted,
+        color_grading,
         bloom,
         transform,
     ));
+
+    if let Some(dof) = dof_for_preset(rig.active_preset, rig.current_distance) {
+        entity.insert(dof);
+    }
 
     if let Some(image_handle) = offscreen.image.as_ref() {
         entity.insert(RenderTarget::Image(image_handle.clone().into()));
@@ -272,7 +337,9 @@ fn handle_hotkeys(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_camera_rig(
+    mut commands: Commands,
     time: Res<Time>,
     app_config: Res<AppConfig>,
     clock: Res<SimClock>,
@@ -281,7 +348,7 @@ fn update_camera_rig(
     mut motion_reader: MessageReader<MouseMotion>,
     mut wheel_reader: MessageReader<MouseWheel>,
     mut rig: ResMut<CameraRig>,
-    mut cam_query: Query<&mut Transform, With<MainStudioCamera>>,
+    mut cam_query: Query<(Entity, &mut Transform, Option<&mut DepthOfField>), With<MainStudioCamera>>,
 ) {
     let mut mouse_delta = Vec2::ZERO;
     for ev in motion_reader.read() {
@@ -343,8 +410,25 @@ fn update_camera_rig(
     );
 
     let clamped_eye = rig.clamped_eye();
-    for mut transform in cam_query.iter_mut() {
+    let desired_dof = dof_for_preset(rig.active_preset, rig.current_distance);
+    for (cam_entity, mut transform, dof_opt) in cam_query.iter_mut() {
         *transform = Transform::from_translation(clamped_eye).looking_at(rig.current_target, Vec3::Y);
+        match (desired_dof, dof_opt) {
+            (Some(target_dof), Some(mut cur_dof)) => {
+                cur_dof.focal_distance = target_dof.focal_distance;
+                cur_dof.aperture_f_stops = target_dof.aperture_f_stops;
+                cur_dof.max_circle_of_confusion_diameter =
+                    target_dof.max_circle_of_confusion_diameter;
+                cur_dof.max_depth = target_dof.max_depth;
+            }
+            (Some(target_dof), None) => {
+                commands.entity(cam_entity).insert(target_dof);
+            }
+            (None, Some(_)) => {
+                commands.entity(cam_entity).remove::<DepthOfField>();
+            }
+            (None, None) => {}
+        }
     }
 }
 

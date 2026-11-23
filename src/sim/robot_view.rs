@@ -2,20 +2,24 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::{
     asset::RenderAssetUsages,
-    image::ImageSampler,
+    camera::visibility::NoFrustumCulling,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    render::render_resource::TextureFormat,
 };
 
-use crate::core::types::{NozzleCap, RackSlotPose};
-use crate::sim::state::{AppConfig, SprayJobRes};
+use crate::core::types::{LinkTransform, NozzleCap, RackSlotPose};
+use crate::sim::state::{AppConfig, SimStepSet, SprayJobRes};
+use crate::sim::textures::{
+    MipmapKind, create_mipmapped_pbr_triplet, create_mipmapped_rgba8_image,
+};
 
 pub fn plugin(app: &mut App) {
     app.init_resource::<HeldCanSlot>()
         .init_resource::<SlotCapVisualState>()
         .init_resource::<StudioRackCache>()
-        .add_systems(Startup, spawn_robot_and_cans);
+        .add_systems(Startup, spawn_robot_and_cans)
+        .add_systems(Update, update_dynamic_dress_pack.in_set(SimStepSet::CanvasAndFx));
 }
 
 /// Identifies a moving link entity driven by [`KinematicChain::fk_links`].
@@ -47,6 +51,51 @@ pub struct CanCapVisual {
     pub cap: NozzleCap,
 }
 
+/// Obstacle-clearance rule pushing the interior of a flexing [`DynamicJointHose`]
+/// cleanly outside joint drums, shafts, and counterweight housings.
+#[derive(Component, Debug, Clone, Copy)]
+pub enum HoseClearance {
+    None,
+    RadialAxis {
+        link: usize,
+        axis: Vec3,
+        min_radius: f32,
+        bias_local: Vec3,
+    },
+    ElbowCounterweight {
+        link4: usize,
+    },
+}
+
+/// Flexing spline hose/conduit mesh continuously updated to bridge adjacent [`RobotLink`]s.
+#[derive(Component, Debug, Clone)]
+pub struct DynamicJointHose {
+    pub link_a: usize,
+    pub pos_a: Vec3,
+    pub tan_a: Vec3,
+    pub link_b: usize,
+    pub pos_b: Vec3,
+    pub tan_b: Vec3,
+    pub radius: f32,
+    pub rings: usize,
+    pub sides: usize,
+    pub slack: f32,
+    pub uv_v_scale: f32,
+    pub clearance: HoseClearance,
+    pub mesh: Handle<Mesh>,
+}
+
+/// Rolling floor energy drag-chain inside the linear rail tray that tracks `rail_x` (`q[0]`).
+#[derive(Component, Debug, Clone)]
+pub struct DynamicDragChain {
+    pub rail_z: f32,
+    pub tray_x_anchor: f32,
+    pub chain_len: f32,
+    pub bend_radius: f32,
+    pub samples: usize,
+    pub mesh: Handle<Mesh>,
+}
+
 /// Tracks which rack slot's spray can is currently held by the gripper.
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct HeldCanSlot(pub Option<usize>);
@@ -76,6 +125,14 @@ pub fn trigger_local_transform(trigger_depressed: f32) -> Transform {
         .with_rotation(Quat::from_rotation_x(-0.24 * t))
 }
 
+/// Deterministic per-slot label yaw in `[0, TAU)` so stored cans sit at natural radial angles
+/// while the detachable nozzle actuator stays aligned along `-Z` for gripper/cockpit repeatability.
+pub fn can_body_label_yaw(slot_index: usize, seed: u64) -> f32 {
+    let seed_mix = ((seed ^ (seed >> 32)) as u32).wrapping_add(4099);
+    let jitter = hash2(slot_index as i32, (slot_index as i32).wrapping_mul(7) + 3, seed_mix);
+    ((slot_index as f32 * 0.618_034 + jitter * 0.45).fract()) * TAU
+}
+
 struct RobotMaterials {
     cast_iron: Handle<StandardMaterial>,
     anodized_dark: Handle<StandardMaterial>,
@@ -86,7 +143,6 @@ struct RobotMaterials {
     rubber: Handle<StandardMaterial>,
     bolt_steel: Handle<StandardMaterial>,
     conduit_straight: Handle<StandardMaterial>,
-    conduit_arc: Handle<StandardMaterial>,
     air_hose: Handle<StandardMaterial>,
     brass: Handle<StandardMaterial>,
     unit07_plate: Handle<StandardMaterial>,
@@ -226,16 +282,16 @@ fn spawn_robot_and_cans(
                 Transform::from_xyz(0.036, 0.010, 0.214).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
                 Transform::from_xyz(0.016, 0.010, 0.214).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
             );
-            // Dress-pack exit boot curving from carriage rear pack up toward Link 1 riser
+            // Compact anodized dress-pack exit gland collars meeting dynamic Link 0 -> Link 1 hoses
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.016, 0.085).mesh().resolution(16).build()))),
-                MeshMaterial3d(mats.conduit_straight.clone()),
-                Transform::from_xyz(0.016, 0.048, 0.158).with_rotation(Quat::from_rotation_x(-0.34)),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0195, 0.014).mesh().resolution(16).build()))),
+                MeshMaterial3d(mats.anodized_dark.clone()),
+                Transform::from_xyz(0.016, 0.028, 0.168),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.007, 0.085).mesh().resolution(12).build()))),
-                MeshMaterial3d(mats.air_hose.clone()),
-                Transform::from_xyz(-0.014, 0.048, 0.158).with_rotation(Quat::from_rotation_x(-0.34)),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0105, 0.014).mesh().resolution(12).build()))),
+                MeshMaterial3d(mats.anodized_dark.clone()),
+                Transform::from_xyz(-0.014, 0.028, 0.168),
             ));
         });
 
@@ -254,7 +310,7 @@ fn spawn_robot_and_cans(
             ));
             // Base degree scale collar
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.1275, 0.022).mesh().resolution(40).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.1280, 0.022).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.0, -0.384, 0.0),
             ));
@@ -328,18 +384,18 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.unit07_plate.clone()),
                 Transform::from_xyz(-0.1122, 0.145, 0.0).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
             ));
-            // Rear (+Z) riser dress-pack clamps, corrugated conduit & pneumatic air hose
+            // Rear (+Z) riser dress-pack clamps, corrugated conduit & pneumatic air hose (y = -0.365..+0.345)
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0155, 0.72).mesh().resolution(16).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0155, 0.71).mesh().resolution(16).build()))),
                 MeshMaterial3d(mats.conduit_straight.clone()),
-                Transform::from_xyz(0.016, -0.01, 0.136),
+                Transform::from_xyz(0.016, -0.010, 0.136),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0068, 0.72).mesh().resolution(12).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0068, 0.71).mesh().resolution(12).build()))),
                 MeshMaterial3d(mats.air_hose.clone()),
-                Transform::from_xyz(-0.014, -0.01, 0.136),
+                Transform::from_xyz(-0.014, -0.010, 0.136),
             ));
-            for &cy in &[-0.22_f32, 0.04, 0.26] {
+            for &cy in &[-0.32_f32, -0.10, 0.12, 0.30] {
                 p.spawn((
                     Mesh3d(shared.clamp_saddle.clone()),
                     MeshMaterial3d(mats.aluminum.clone()),
@@ -369,7 +425,7 @@ fn spawn_robot_and_cans(
             ));
             // Machined degree scale band around shoulder drum
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0835, 0.022).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0840, 0.022).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.086, 0.0, 0.0).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
@@ -434,36 +490,20 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.aluminum.clone()),
                 Transform::from_xyz(0.0, half_l2 - 0.003, 0.0),
             ));
-            // Rear (+Z) dress-pack conduit & air hose clamped to Link 2 spine + shoulder loop
+            // Rear (+Z) dress-pack conduit & air hose clamped cleanly along Link 2 spine (y = 0.075..0.275)
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Torus {
-                        minor_radius: 0.014,
-                        major_radius: 0.055,
-                    }
-                    .mesh()
-                    .minor_resolution(14)
-                    .major_resolution(20)
-                    .angle_range(0.0..=PI)
-                    .build(),
-                ))),
-                MeshMaterial3d(mats.conduit_arc.clone()),
-                Transform::from_xyz(0.016, 0.010, 0.088)
-                    .with_rotation(Quat::from_rotation_z(-FRAC_PI_2)),
-            ));
-            p.spawn((
-                Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.014, (half_l2 - 0.08).max(0.06)).mesh().resolution(16).build(),
+                    Cylinder::new(0.014, 0.20).mesh().resolution(16).build(),
                 ))),
                 MeshMaterial3d(mats.conduit_straight.clone()),
-                Transform::from_xyz(0.016, half_l2 * 0.5 + 0.01, 0.100),
+                Transform::from_xyz(0.016, 0.175, 0.100),
             ));
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.0062, (half_l2 - 0.08).max(0.06)).mesh().resolution(12).build(),
+                    Cylinder::new(0.0062, 0.20).mesh().resolution(12).build(),
                 ))),
                 MeshMaterial3d(mats.air_hose.clone()),
-                Transform::from_xyz(-0.012, half_l2 * 0.5 + 0.01, 0.100),
+                Transform::from_xyz(-0.012, 0.175, 0.100),
             ));
             for &cy in &[0.095_f32, 0.245] {
                 p.spawn((
@@ -475,7 +515,7 @@ fn spawn_robot_and_cans(
         });
 
     // Link 3: upper_arm_roll rotary swivel joint at mid-upper-arm (+Y axis, extends +Y by L2 * 0.5 = 0.34m to elbow_pitch)
-    let swivel_bolts = bolt_ring_transforms(0.059, 8, Vec3::Y, Vec3::new(0.0, 0.030, 0.0));
+    let swivel_bolts = bolt_ring_transforms(0.059, 8, Vec3::Y, Vec3::new(0.0, 0.0310, 0.0));
     commands
         .spawn((RobotLink { index: 3 }, link_tf(3), Visibility::default()))
         .with_children(|p| {
@@ -491,7 +531,7 @@ fn spawn_robot_and_cans(
                 Transform::from_xyz(0.0, 0.018, 0.0),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0672, 0.014).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0680, 0.014).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.0, 0.018, 0.0),
             ));
@@ -527,25 +567,25 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.anodized_dark.clone()),
                 Transform::from_xyz(0.0, half_l2 - 0.036, 0.0),
             ));
-            // Rear (+Z) upper-arm dress-pack conduit & air hose
+            // Rear (+Z) upper-arm dress-pack conduit & air hose clamped cleanly along Link 3 (y = 0.085..0.265)
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.013, (half_l2 - 0.08).max(0.06)).mesh().resolution(16).build(),
+                    Cylinder::new(0.013, 0.18).mesh().resolution(16).build(),
                 ))),
                 MeshMaterial3d(mats.conduit_straight.clone()),
-                Transform::from_xyz(0.015, half_l2 * 0.5 + 0.01, 0.091),
+                Transform::from_xyz(0.015, 0.175, 0.091),
             ));
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.0058, (half_l2 - 0.08).max(0.06)).mesh().resolution(12).build(),
+                    Cylinder::new(0.0058, 0.18).mesh().resolution(12).build(),
                 ))),
                 MeshMaterial3d(mats.air_hose.clone()),
-                Transform::from_xyz(-0.012, half_l2 * 0.5 + 0.01, 0.091),
+                Transform::from_xyz(-0.012, 0.175, 0.091),
             ));
             p.spawn((
                 Mesh3d(shared.clamp_saddle.clone()),
                 MeshMaterial3d(mats.aluminum.clone()),
-                Transform::from_xyz(0.0, half_l2 * 0.5 + 0.005, 0.080),
+                Transform::from_xyz(0.0, 0.175, 0.080),
             ));
         });
 
@@ -556,8 +596,6 @@ fn spawn_robot_and_cans(
     let elbow_bolts_neg = bolt_ring_transforms(0.056, 8, Vec3::NEG_X, Vec3::new(-0.098, 0.0, 0.0));
     let unit07_side_quad = meshes.add(make_decal_quad_mesh(0.076, 0.0285));
     let unit07_side_backing = meshes.add(with_tangents(Cuboid::new(0.003, 0.032, 0.080).mesh().build()));
-    let unit07_rear_quad = meshes.add(make_decal_quad_mesh(0.096, 0.036));
-    let unit07_rear_backing = meshes.add(with_tangents(Cuboid::new(0.100, 0.040, 0.003).mesh().build()));
     commands
         .spawn((RobotLink { index: 4 }, link_tf(4), Visibility::default()))
         .with_children(|p| {
@@ -568,7 +606,7 @@ fn spawn_robot_and_cans(
                 Transform::from_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0695, 0.020).mesh().resolution(36).build()))),
+                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0700, 0.020).mesh().resolution(32).build()))),
                 MeshMaterial3d(mats.degree_scale.clone()),
                 Transform::from_xyz(0.072, 0.0, 0.0).with_rotation(Quat::from_rotation_z(FRAC_PI_2)),
             ));
@@ -612,15 +650,11 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.unit07_plate.clone()),
                 Transform::from_xyz(-0.057, 0.024, 0.109).with_rotation(Quat::from_rotation_y(-FRAC_PI_2)),
             ));
+            // Compact anodized rear cable-guide saddle bar framing the elbow dress-pack
             p.spawn((
-                Mesh3d(unit07_rear_backing),
+                Mesh3d(meshes.add(with_tangents(Cuboid::new(0.068, 0.024, 0.012).mesh().build()))),
                 MeshMaterial3d(mats.anodized_dark.clone()),
-                Transform::from_xyz(0.0, 0.026, 0.1515),
-            ));
-            p.spawn((
-                Mesh3d(unit07_rear_quad),
-                MeshMaterial3d(mats.unit07_plate.clone()),
-                Transform::from_xyz(0.0, 0.026, 0.1535),
+                Transform::from_xyz(0.0, 0.026, 0.156),
             ));
             // Safety-orange tapered forearm tube (-Z direction: top/v=1 points along -Z toward wrist)
             p.spawn((
@@ -643,27 +677,10 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.graphite.clone()),
                 Transform::from_xyz(0.0, 0.058, -l3 * 0.5),
             ));
-            // Elbow loop (Torus arc arching cleanly above elbow drum into forearm spine)
+            // Forearm corrugated conduit & pneumatic air hose clamped along top (+Y) spine (z = -0.11..-0.49)
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Torus {
-                        minor_radius: 0.0125,
-                        major_radius: 0.075,
-                    }
-                    .mesh()
-                    .minor_resolution(14)
-                    .major_resolution(24)
-                    .angle_range(0.0..=PI)
-                    .build(),
-                ))),
-                MeshMaterial3d(mats.conduit_arc.clone()),
-                Transform::from_xyz(0.012, 0.044, 0.032)
-                    .with_rotation(Quat::from_rotation_y(FRAC_PI_2)),
-            ));
-            // Forearm corrugated conduit & pneumatic air hose along top (+Y) spine
-            p.spawn((
-                Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.012, l3 - 0.10).mesh().resolution(16).build(),
+                    Cylinder::new(0.012, (l3 - 0.22).max(0.10)).mesh().resolution(16).build(),
                 ))),
                 MeshMaterial3d(mats.conduit_straight.clone()),
                 Transform::from_xyz(0.012, 0.080, -l3 * 0.5)
@@ -671,7 +688,7 @@ fn spawn_robot_and_cans(
             ));
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(
-                    Cylinder::new(0.0055, l3 - 0.10).mesh().resolution(12).build(),
+                    Cylinder::new(0.0055, (l3 - 0.22).max(0.10)).mesh().resolution(12).build(),
                 ))),
                 MeshMaterial3d(mats.air_hose.clone()),
                 Transform::from_xyz(-0.011, 0.078, -l3 * 0.5)
@@ -715,16 +732,16 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.aluminum.clone()),
                 Transform::from_xyz(0.040, 0.0, -0.054),
             ));
-            // Wrist dress-pack saddle clamp & flexible air jumper on +Y
+            // Wrist dress-pack saddle clamp & machined brass pneumatic Y-splitter manifold on +Y
             p.spawn((
                 Mesh3d(meshes.add(with_tangents(Cuboid::new(0.036, 0.012, 0.018).mesh().build()))),
                 MeshMaterial3d(mats.anodized_dark.clone()),
                 Transform::from_xyz(0.0, 0.046, -0.022),
             ));
             p.spawn((
-                Mesh3d(meshes.add(with_tangents(Cylinder::new(0.005, 0.056).mesh().resolution(10).build()))),
-                MeshMaterial3d(mats.air_hose.clone()),
-                Transform::from_xyz(-0.009, 0.052, -0.026).with_rotation(Quat::from_rotation_x(FRAC_PI_2)),
+                Mesh3d(meshes.add(with_tangents(Cuboid::new(0.028, 0.012, 0.014).mesh().build()))),
+                MeshMaterial3d(mats.brass.clone()),
+                Transform::from_xyz(0.0, 0.052, -0.028),
             ));
             for tf in wrist1_bolts {
                 spawn_bolt(p, &shared.bolt_m5, &shared.bolt_washer_m8, &mats.bolt_steel, tf);
@@ -808,18 +825,12 @@ fn spawn_robot_and_cans(
                 MeshMaterial3d(mats.aluminum.clone()),
                 Transform::from_xyz(0.0, 0.0, -0.022),
             ));
-            // Brass pneumatic push-to-connect air fittings + manifold hoses on top rear of gripper body
+            // Brass pneumatic push-to-connect air fittings on top rear of gripper body (fed by DynamicJointHose jumpers)
             for &fx in &[-0.044_f32, 0.044] {
                 p.spawn((
                     Mesh3d(shared.air_fitting.clone()),
                     MeshMaterial3d(mats.brass.clone()),
                     Transform::from_xyz(fx, 0.022, -0.010),
-                ));
-                p.spawn((
-                    Mesh3d(meshes.add(with_tangents(Cylinder::new(0.0035, 0.032).mesh().resolution(10).build()))),
-                    MeshMaterial3d(mats.air_hose.clone()),
-                    Transform::from_xyz(fx * 0.78, 0.036, -0.004)
-                        .with_rotation(Quat::from_rotation_z(fx.signum() * 0.55)),
                 ));
             }
             // Left parallel gripper jaw (-X)
@@ -881,17 +892,23 @@ fn spawn_robot_and_cans(
             });
         });
 
+    // Dynamic articulated hoses & corrugated conduits bridging every moving joint seamlessly
+    spawn_dynamic_joint_hoses(&mut commands, &mut meshes, &mats, &link_xforms);
+    spawn_dynamic_drag_chain(
+        &mut commands,
+        &mut meshes,
+        &mats,
+        studio.rail_z,
+        frame.joints[0] as f32,
+    );
+
     // Shared PBR meshes & materials for aerosol spray cans (sizes & clearances preserved verbatim)
     let can_steel_mat = materials.add(StandardMaterial {
         base_color: Color::srgb(0.78, 0.80, 0.84),
-        metallic: 0.85,
-        perceptual_roughness: 0.25,
-        ..default()
-    });
-    let label_band_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.12, 0.13, 0.15),
-        metallic: 0.08,
-        perceptual_roughness: 0.50,
+        metallic: 0.90,
+        perceptual_roughness: 0.20,
+        clearcoat: 0.35,
+        clearcoat_perceptual_roughness: 0.16,
         ..default()
     });
     let white_nozzle_mat = materials.add(StandardMaterial {
@@ -909,7 +926,7 @@ fn spawn_robot_and_cans(
     let cyan_cap_mat = materials.add(StandardMaterial {
         base_color: Srgba::hex("#00E5FF").unwrap().into(),
         metallic: 0.08,
-        perceptual_roughness: 0.36,
+        perceptual_roughness: 0.34,
         ..default()
     });
     let needle_metal_mat = materials.add(StandardMaterial {
@@ -920,8 +937,17 @@ fn spawn_robot_and_cans(
     });
 
     let bottom_rim_mesh = meshes.add(Cylinder::new(0.033, 0.010));
-    let body_mesh = meshes.add(Cylinder::new(0.0328, 0.122));
-    let label_stripe_mesh = meshes.add(Cylinder::new(0.0331, 0.018));
+    let body_mesh = meshes.add(Cylinder::new(0.0328, 0.122).mesh().resolution(32).build());
+    let crimp_ring_mesh = meshes.add(
+        Torus {
+            minor_radius: 0.0020,
+            major_radius: 0.0315,
+        }
+        .mesh()
+        .minor_resolution(10)
+        .major_resolution(32)
+        .build(),
+    );
     let shoulder_mesh = meshes.add(
         ConicalFrustum {
             radius_top: 0.018,
@@ -940,16 +966,25 @@ fn spawn_robot_and_cans(
 
     for can in &spray_job.palette.cans {
         let can_color = Color::srgb_u8(can.color_srgb[0], can.color_srgb[1], can.color_srgb[2]);
+        let (label_albedo, label_rm) =
+            build_spray_can_label_textures(can.color_srgb, can.slot_index, 256);
         let body_mat = materials.add(StandardMaterial {
-            base_color: can_color,
-            metallic: 0.14,
-            perceptual_roughness: 0.34,
+            base_color: Color::WHITE,
+            base_color_texture: Some(images.add(label_albedo)),
+            metallic_roughness_texture: Some(images.add(label_rm)),
+            metallic: 1.0,
+            perceptual_roughness: 1.0,
+            reflectance: 0.62,
+            clearcoat: 0.80,
+            clearcoat_perceptual_roughness: 0.14,
             ..default()
         });
         let cap_mat = materials.add(StandardMaterial {
             base_color: can_color,
-            metallic: 0.04,
-            perceptual_roughness: 0.42,
+            metallic: 0.05,
+            perceptual_roughness: 0.38,
+            clearcoat: 0.55,
+            clearcoat_perceptual_roughness: 0.22,
             ..default()
         });
 
@@ -980,6 +1015,7 @@ fn spawn_robot_and_cans(
         } else {
             Visibility::Hidden
         };
+        let body_yaw = can_body_label_yaw(can.slot_index, app_config.cli.seed);
 
         commands.spawn((
             CanEntity {
@@ -994,17 +1030,22 @@ fn spawn_robot_and_cans(
                     MeshMaterial3d(can_steel_mat.clone()),
                     Transform::from_xyz(0.0, -0.080, 0.0),
                 ),
-                // Main colored aerosol body (-0.075..+0.047)
+                // Main colored aerosol body (-0.075..+0.047) with wraparound litho label & rolled crimp seams
                 (
                     Mesh3d(body_mesh.clone()),
                     MeshMaterial3d(body_mat),
-                    Transform::from_xyz(0.0, -0.014, 0.0),
+                    Transform::from_xyz(0.0, -0.014, 0.0)
+                        .with_rotation(Quat::from_rotation_y(body_yaw)),
                 ),
-                // Crisp dark lower collar band
                 (
-                    Mesh3d(label_stripe_mesh.clone()),
-                    MeshMaterial3d(label_band_mat.clone()),
-                    Transform::from_xyz(0.0, -0.056, 0.0),
+                    Mesh3d(crimp_ring_mesh.clone()),
+                    MeshMaterial3d(can_steel_mat.clone()),
+                    Transform::from_xyz(0.0, 0.047, 0.0),
+                ),
+                (
+                    Mesh3d(crimp_ring_mesh.clone()),
+                    MeshMaterial3d(can_steel_mat.clone()),
+                    Transform::from_xyz(0.0, -0.075, 0.0),
                 ),
                 // Domed steel shoulder (+0.047..+0.071)
                 (
@@ -1156,11 +1197,13 @@ fn make_decal_quad_mesh(width: f32, height: f32) -> Mesh {
     with_tangents(mesh)
 }
 
-fn add_pbr_material(
+fn add_pbr_material_clearcoat(
     materials: &mut ResMut<Assets<StandardMaterial>>,
     images: &mut ResMut<Assets<Image>>,
     (albedo, rough_metal, normal): (Image, Image, Image),
     reflectance: f32,
+    clearcoat: f32,
+    clearcoat_perceptual_roughness: f32,
 ) -> Handle<StandardMaterial> {
     materials.add(StandardMaterial {
         base_color: Color::WHITE,
@@ -1170,8 +1213,19 @@ fn add_pbr_material(
         metallic: 1.0,
         perceptual_roughness: 1.0,
         reflectance,
+        clearcoat,
+        clearcoat_perceptual_roughness,
         ..default()
     })
+}
+
+fn add_pbr_material(
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    images: &mut ResMut<Assets<Image>>,
+    textures: (Image, Image, Image),
+    reflectance: f32,
+) -> Handle<StandardMaterial> {
+    add_pbr_material_clearcoat(materials, images, textures, reflectance, 0.0, 0.5)
 }
 
 fn build_robot_materials(
@@ -1179,24 +1233,34 @@ fn build_robot_materials(
     images: &mut ResMut<Assets<Image>>,
 ) -> RobotMaterials {
     let cast_iron = add_pbr_material(materials, images, build_cast_iron_textures(256), 0.5);
-    let anodized_dark = add_pbr_material(materials, images, build_anodized_dark_textures(256), 0.55);
-    let safety_orange = add_pbr_material(
+    let anodized_dark = add_pbr_material_clearcoat(
+        materials,
+        images,
+        build_anodized_dark_textures(256),
+        0.55,
+        0.35,
+        0.22,
+    );
+    let safety_orange = add_pbr_material_clearcoat(
         materials,
         images,
         build_safety_orange_textures(256, 0.0),
         0.52,
+        0.65,
+        0.18,
     );
-    let safety_orange_distal = add_pbr_material(
+    let safety_orange_distal = add_pbr_material_clearcoat(
         materials,
         images,
         build_safety_orange_textures(256, 1.0),
         0.52,
+        0.65,
+        0.18,
     );
     let graphite = add_pbr_material(materials, images, build_graphite_textures(256), 0.5);
     let aluminum = add_pbr_material(materials, images, build_brushed_aluminum_textures(256), 0.65);
     let rubber = add_pbr_material(materials, images, build_rubber_grip_textures(256), 0.35);
     let conduit_straight = add_pbr_material(materials, images, build_conduit_textures(256, true), 0.4);
-    let conduit_arc = add_pbr_material(materials, images, build_conduit_textures(256, false), 0.4);
 
     let bolt_steel = materials.add(StandardMaterial {
         base_color: Color::srgb(0.38, 0.41, 0.46),
@@ -1240,8 +1304,8 @@ fn build_robot_materials(
     let degree_scale = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(images.add(build_degree_scale_collar_texture(512, 64))),
-        metallic: 0.75,
-        perceptual_roughness: 0.28,
+        metallic: 0.68,
+        perceptual_roughness: 0.34,
         ..default()
     });
     let led_green = materials.add(StandardMaterial {
@@ -1265,7 +1329,6 @@ fn build_robot_materials(
         rubber,
         bolt_steel,
         conduit_straight,
-        conduit_arc,
         air_hose,
         brass,
         unit07_plate,
@@ -1312,22 +1375,6 @@ fn fbm(x: f32, y: f32, seed: u32) -> f32 {
     sum
 }
 
-fn create_rgba8_image(width: u32, height: u32, data: Vec<u8>, format: TextureFormat) -> Image {
-    let mut img = Image::new(
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        format,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    img.sampler = ImageSampler::linear();
-    img
-}
-
 fn normal_map_from_heights(heights: &[f32], width: u32, height: u32, strength: f32) -> Vec<u8> {
     let mut out = Vec::with_capacity((width * height * 4) as usize);
     let w = width as i32;
@@ -1369,8 +1416,8 @@ fn build_cast_iron_textures(size: u32) -> (Image, Image, Image) {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
             let macro_grain = fbm(u * 14.0, v * 14.0, 101);
-            let pebble = fbm(u * 62.0, v * 62.0, 137);
-            let micro_pit = hash2(x as i32, y as i32, 173);
+            let pebble = fbm(u * 36.0, v * 36.0, 137);
+            let micro_pit = value_noise(u * 48.0, v * 48.0, 173);
 
             let crest = (pebble * 0.72 + micro_pit * 0.28).clamp(0.0, 1.0);
             let luma = (0.155 + 0.038 * macro_grain + 0.036 * crest).clamp(0.11, 0.25);
@@ -1390,12 +1437,8 @@ fn build_cast_iron_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 2.2);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 1.5);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Safety orange armor: powder-coat orange-peel normal + subtle edge wear + optional distal dried spray mist.
@@ -1420,13 +1463,13 @@ fn build_safety_orange_textures(size: u32, mist_strength: f32) -> (Image, Image,
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
 
-            let orange_peel = fbm(u * 44.0, v * 44.0, 211);
-            let micro_coat = fbm(u * 96.0, v * 96.0, 239);
+            let orange_peel = fbm(u * 24.0, v * 24.0, 211);
+            let micro_coat = value_noise(u * 48.0, v * 48.0, 239);
             let panel_var = fbm(u * 6.0, v * 6.0, 257);
 
             // Subtle edge/collar wear near v=0 or v=1 (plus faint corner scuffs)
             let edge_dist = v.min(1.0 - v);
-            let wear_noise = fbm(u * 26.0, v * 26.0, 277);
+            let wear_noise = fbm(u * 20.0, v * 20.0, 277);
             let edge_mask = ((0.055 - edge_dist) / 0.055).clamp(0.0, 1.0);
             let wear = ((edge_mask * 1.15 + (wear_noise - 0.68) * 1.8).clamp(0.0, 1.0)
                 * edge_mask)
@@ -1490,12 +1533,8 @@ fn build_safety_orange_textures(size: u32, mist_strength: f32) -> (Image, Image,
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.25);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.65);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Anodized dark joints: lathe-turned concentric micro-grooves + darker recessed contrast.
@@ -1509,9 +1548,9 @@ fn build_anodized_dark_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            let lathe = (v * 90.0 * TAU).sin() * 0.5 + 0.5;
-            let band = fbm(u * 4.0, v * 36.0, 401);
-            let micro = fbm(u * 28.0, v * 64.0, 419);
+            let lathe = (v * 32.0 * TAU).sin() * 0.5 + 0.5;
+            let band = fbm(u * 4.0, v * 20.0, 401);
+            let micro = fbm(u * 18.0, v * 36.0, 419);
 
             let recessed = ((0.06 - v.min(1.0 - v)) / 0.06).clamp(0.0, 1.0);
             let luma = (0.088 + 0.018 * band + 0.010 * lathe - 0.022 * recessed).clamp(0.055, 0.14);
@@ -1531,15 +1570,11 @@ fn build_anodized_dark_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.35);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.75);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
-/// Brushed aluminum: directional brushed-metal streaks + crisp studio HDR tube reflections.
+/// Brushed aluminum: band-limited directional brushed-metal streaks + crisp studio HDR tube reflections.
 fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
     let n = (size * size) as usize;
     let mut albedo = Vec::with_capacity(n * 4);
@@ -1550,13 +1585,12 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            // Fine anisotropic streaks running primarily along U
-            let streak_fine = value_noise(u * 10.0, v * 170.0, 503);
-            let streak_med = fbm(u * 5.0, v * 72.0, 521);
-            let micro = hash2(x as i32, y as i32, 541) * 0.08;
+            // Band-limited anisotropic brushed streaks running primarily along U (no raw per-texel hash)
+            let streak_fine = value_noise(u * 8.0, v * 64.0, 503);
+            let streak_med = fbm(u * 4.0, v * 28.0, 521);
 
-            let brush = (streak_fine * 0.60 + streak_med * 0.35 + micro).clamp(0.0, 1.0);
-            let luma = (0.73 + 0.10 * brush).clamp(0.68, 0.87);
+            let brush = (streak_fine * 0.60 + streak_med * 0.40).clamp(0.0, 1.0);
+            let luma = (0.74 + 0.08 * brush).clamp(0.70, 0.86);
             albedo.extend_from_slice(&[
                 to_u8(luma * 0.97),
                 to_u8(luma * 0.99),
@@ -1564,8 +1598,8 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
                 255,
             ]);
 
-            // Low roughness (0.16..0.26) + high metallic (0.92..0.95) for crisp tube reflections
-            let roughness = (0.16 + 0.10 * (1.0 - brush)).clamp(0.15, 0.28);
+            // Low roughness (0.18..0.28) + high metallic (0.93) for smooth studio tube reflections
+            let roughness = (0.18 + 0.10 * (1.0 - brush)).clamp(0.18, 0.28);
             let metallic = 0.93_f32;
             rough_metal.extend_from_slice(&[0, to_u8(roughness), to_u8(metallic), 255]);
 
@@ -1573,12 +1607,8 @@ fn build_brushed_aluminum_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 0.85);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 0.40);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Structural satin graphite-steel finish for riser & spine ribs.
@@ -1592,7 +1622,7 @@ fn build_graphite_textures(size: u32) -> (Image, Image, Image) {
         for x in 0..size {
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
-            let grain = fbm(u * 40.0, v * 40.0, 601);
+            let grain = fbm(u * 32.0, v * 32.0, 601);
             let blotch = fbm(u * 9.0, v * 9.0, 617);
             let luma = (0.235 + 0.055 * blotch + 0.032 * grain).clamp(0.18, 0.34);
             albedo.extend_from_slice(&[
@@ -1610,12 +1640,8 @@ fn build_graphite_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 1.35);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 1.15);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Rubber / Gripper pads: diamond-knurled & ribbed tactile pad texture.
@@ -1632,7 +1658,7 @@ fn build_rubber_grip_textures(size: u32) -> (Image, Image, Image) {
             let d1 = ((u + v) * 26.0 * PI).sin().abs();
             let d2 = ((u - v) * 26.0 * PI).sin().abs();
             let knurl = (d1 * d2).powf(0.65);
-            let micro = fbm(u * 48.0, v * 48.0, 701);
+            let micro = fbm(u * 36.0, v * 36.0, 701);
 
             let luma = (0.048 + 0.028 * knurl + 0.010 * micro).clamp(0.035, 0.095);
             albedo.extend_from_slice(&[to_u8(luma), to_u8(luma), to_u8(luma * 1.06), 255]);
@@ -1644,12 +1670,8 @@ fn build_rubber_grip_textures(size: u32) -> (Image, Image, Image) {
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 3.0);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 2.6);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 /// Corrugated black polymer dress-pack conduit (`rings_along_v = true` for Cylinder, `false` for Torus).
@@ -1664,8 +1686,8 @@ fn build_conduit_textures(size: u32, rings_along_v: bool) -> (Image, Image, Imag
             let u = x as f32 / size as f32;
             let v = y as f32 / size as f32;
             let axis = if rings_along_v { v } else { u };
-            let ridge = ((axis * 54.0 * TAU).sin() * 0.5 + 0.5).powf(0.8);
-            let micro = fbm(u * 32.0, v * 32.0, 809);
+            let ridge = ((axis * 36.0 * TAU).sin() * 0.5 + 0.5).powf(0.8);
+            let micro = fbm(u * 24.0, v * 24.0, 809);
 
             let luma = (0.055 + 0.036 * ridge + 0.010 * micro).clamp(0.04, 0.12);
             albedo.extend_from_slice(&[to_u8(luma), to_u8(luma), to_u8(luma * 1.05), 255]);
@@ -1677,12 +1699,8 @@ fn build_conduit_textures(size: u32, rings_along_v: bool) -> (Image, Image, Imag
         }
     }
 
-    let normal = normal_map_from_heights(&heights, size, size, 3.2);
-    (
-        create_rgba8_image(size, size, albedo, TextureFormat::Rgba8UnormSrgb),
-        create_rgba8_image(size, size, rough_metal, TextureFormat::Rgba8Unorm),
-        create_rgba8_image(size, size, normal, TextureFormat::Rgba8Unorm),
-    )
+    let normal = normal_map_from_heights(&heights, size, size, 2.2);
+    create_mipmapped_pbr_triplet(size, size, albedo, rough_metal, normal, true, true)
 }
 
 #[inline]
@@ -1849,7 +1867,15 @@ fn build_unit07_stencil_texture(width: u32, height: u32) -> Image {
         }
     }
 
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
 /// Yellow-and-black diagonal pinch/crush hazard chevron band texture.
@@ -1878,7 +1904,15 @@ fn build_hazard_chevron_texture(width: u32, height: u32) -> Image {
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
 /// Radial machined servo encoder dial cap texture (`256x256`).
@@ -1923,10 +1957,31 @@ fn build_encoder_dial_texture(size: u32) -> Image {
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(size, size, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        size,
+        size,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        false,
+        false,
+    )
 }
 
-/// Cylindrical wrap-around degree scale ring texture (`512x64`).
+#[inline]
+fn wrap_unit_dist(phase: f32) -> f32 {
+    let f = phase.fract();
+    f.min(1.0 - f)
+}
+
+#[inline]
+fn smooth_falloff(dist: f32, half_width: f32, aa_width: f32) -> f32 {
+    let t = ((dist - half_width) / aa_width).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// Cylindrical wrap-around degree scale ring texture (`512x64`) with anti-aliased etched
+/// 30° major & 10° medium ticks (no sub-pixel moiré ticks).
 fn build_degree_scale_collar_texture(width: u32, height: u32) -> Image {
     let mut data = Vec::with_capacity((width * height * 4) as usize);
 
@@ -1935,28 +1990,837 @@ fn build_degree_scale_collar_texture(width: u32, height: u32) -> Image {
             let u = (px as f32 + 0.5) / width as f32;
             let v = (py as f32 + 0.5) / height as f32;
 
-            let mut rgb = [0.58_f32, 0.61, 0.66];
-            if v < 0.12 || v > 0.88 {
-                rgb = [0.11, 0.12, 0.14];
+            // Smooth brushed satin aluminum base band with chamfered dark borders
+            let rim_fade = (1.0 - smooth_falloff((v - 0.12).max(0.0), 0.0, 0.03))
+                .max(1.0 - smooth_falloff((0.88 - v).max(0.0), 0.0, 0.03));
+            let base = [0.56_f32, 0.59, 0.64];
+            let border = [0.11_f32, 0.12, 0.14];
+            let mut rgb = if v < 0.12 || v > 0.88 {
+                border
             } else {
-                let p12 = (u * 12.0).fract();
-                let p36 = (u * 36.0).fract();
-                let p72 = (u * 72.0).fract();
-                let major = (p12 < 0.055 || p12 > 0.945) && (0.16..=0.84).contains(&v);
-                let med = (p36 < 0.08 || p36 > 0.92) && (0.28..=0.84).contains(&v);
-                let fine = (p72 < 0.10 || p72 > 0.90) && (0.52..=0.84).contains(&v);
+                [
+                    base[0] * (1.0 - rim_fade) + border[0] * rim_fade,
+                    base[1] * (1.0 - rim_fade) + border[1] * rim_fade,
+                    base[2] * (1.0 - rim_fade) + border[2] * rim_fade,
+                ]
+            };
 
-                if u < 0.008 || u > 0.992 {
-                    rgb = [0.91, 0.36, 0.10];
-                } else if major || med || fine {
-                    rgb = [0.09, 0.10, 0.12];
+            if (0.12..=0.88).contains(&v) {
+                let d12 = wrap_unit_dist(u * 12.0) / 12.0;
+                let d36 = wrap_unit_dist(u * 36.0) / 36.0;
+                let datum_d = wrap_unit_dist(u);
+
+                let datum_w = smooth_falloff(datum_d, 0.0045, 0.0030)
+                    * smooth_falloff((0.50 - v).abs(), 0.34, 0.03);
+                let major_w = smooth_falloff(d12, 0.0028, 0.0018)
+                    * smooth_falloff((0.50 - v).abs(), 0.28, 0.03);
+                let med_w = smooth_falloff(d36, 0.0018, 0.0014)
+                    * smooth_falloff((0.56 - v).abs(), 0.20, 0.03);
+
+                let tick_w = major_w.max(med_w * 0.85);
+                let tick_col = [0.12_f32, 0.13, 0.15];
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * (1.0 - tick_w) + tick_col[c] * tick_w;
+                }
+                let datum_col = [0.91_f32, 0.36, 0.10];
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * (1.0 - datum_w) + datum_col[c] * datum_w;
                 }
             }
 
             data.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
         }
     }
-    create_rgba8_image(width, height, data, TextureFormat::Rgba8UnormSrgb)
+    create_mipmapped_rgba8_image(
+        width,
+        height,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        MipmapKind::SrgbColor,
+        true,
+        false,
+    )
+}
+
+/// Generates a procedural 256x256 wraparound aerosol can litho label with prominent color swatch
+/// bands, matte graphic belly label, barcode, warning icon, and subtle collar mist wear.
+fn build_spray_can_label_textures(
+    color_srgb: [u8; 3],
+    slot_index: usize,
+    size: u32,
+) -> (Image, Image) {
+    let n = (size * size) as usize;
+    let mut albedo = Vec::with_capacity(n * 4);
+    let mut rough_metal = Vec::with_capacity(n * 4);
+
+    let paint_rgb = [
+        color_srgb[0] as f32 / 255.0,
+        color_srgb[1] as f32 / 255.0,
+        color_srgb[2] as f32 / 255.0,
+    ];
+    let luma_paint = 0.299 * paint_rgb[0] + 0.587 * paint_rgb[1] + 0.114 * paint_rgb[2];
+    let contrast_ink = if luma_paint > 0.55 {
+        [0.09_f32, 0.10, 0.12]
+    } else {
+        [0.92_f32, 0.92, 0.90]
+    };
+
+    for y in 0..size {
+        for x in 0..size {
+            let u = x as f32 / size as f32;
+            let v = y as f32 / size as f32;
+
+            let grain = fbm(u * 40.0 + slot_index as f32 * 1.7, v * 40.0, 907);
+            let scuff = fbm(u * 18.0, v * 8.0, 919 + slot_index as u32);
+
+            let mut rgb = paint_rgb;
+            let mut rough = 0.24 + 0.05 * grain;
+            let mut metallic = 0.08;
+
+            // Central dark litho graphic label wrap (v in 0.24..0.78)
+            if (0.24..=0.78).contains(&v) {
+                if (0.24..=0.26).contains(&v) || (0.76..=0.78).contains(&v) {
+                    // Thin crisp metallic aluminum foil pin-stripe borders
+                    rgb = [0.74, 0.77, 0.81];
+                    rough = 0.22;
+                    metallic = 0.86;
+                } else {
+                    rgb = [
+                        0.085 + 0.015 * grain,
+                        0.092 + 0.015 * grain,
+                        0.108 + 0.018 * grain,
+                    ];
+                    rough = 0.42 + 0.08 * grain;
+                    metallic = 0.04;
+
+                    // Prominent front brand color swatch block & diagonal graphic bar
+                    if (0.34..=0.45).contains(&v) && ((u - 0.5).abs() < 0.24) {
+                        rgb = paint_rgb;
+                        rough = 0.28;
+                    }
+                    // Bold synthetic brand title bars on front half (u in 0.22..0.78)
+                    if (0.49..=0.58).contains(&v) && ((u - 0.5).abs() < 0.26) {
+                        let letter_cell = ((u * 28.0).fract() - 0.5).abs();
+                        if letter_cell < 0.34 {
+                            rgb = contrast_ink;
+                            rough = 0.36;
+                        }
+                    }
+                    // Technical spec subtitle line
+                    if (0.62..=0.66).contains(&v) && ((u - 0.5).abs() < 0.20) {
+                        let dot_cell = ((u * 52.0).fract() - 0.5).abs();
+                        if dot_cell < 0.32 {
+                            rgb = [0.76, 0.78, 0.82];
+                        }
+                    }
+                    // Rear barcode + small orange GHS hazard diamond (u in 0.82..0.96 or 0.04..0.16)
+                    if (0.38..=0.68).contains(&v) && (u > 0.82 && u < 0.96) {
+                        let bc_x = (u * 190.0).floor() as i32;
+                        let on_bar = hash2(bc_x, slot_index as i32, 953) > 0.42;
+                        rgb = if on_bar {
+                            [0.10, 0.11, 0.12]
+                        } else {
+                            [0.89, 0.89, 0.87]
+                        };
+                        rough = 0.52;
+                    }
+                    let du = (u - 0.11).abs();
+                    let dv = (v - 0.53).abs() * 0.7;
+                    let d_man = du + dv;
+                    if (0.40..=0.66).contains(&v) && d_man < 0.065 {
+                        if d_man > 0.045 {
+                            rgb = [0.88, 0.24, 0.10];
+                        } else {
+                            rgb = [0.92, 0.91, 0.88];
+                        }
+                    }
+                }
+            }
+
+            // Faint paint mist & rim handling scuff near top/bottom
+            if v < 0.16 && scuff > 0.62 {
+                let w = ((scuff - 0.62) * 1.4).clamp(0.0, 0.35);
+                rgb[0] = rgb[0] * (1.0 - w) + paint_rgb[0] * w;
+                rgb[1] = rgb[1] * (1.0 - w) + paint_rgb[1] * w;
+                rgb[2] = rgb[2] * (1.0 - w) + paint_rgb[2] * w;
+                rough = (rough + 0.18 * w).clamp(0.18, 0.80);
+            }
+
+            albedo.extend_from_slice(&[to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), 255]);
+            rough_metal.extend_from_slice(&[0, to_u8(rough), to_u8(metallic), 255]);
+        }
+    }
+
+    (
+        create_mipmapped_rgba8_image(
+            size,
+            size,
+            albedo,
+            TextureFormat::Rgba8UnormSrgb,
+            MipmapKind::SrgbColor,
+            true,
+            false,
+        ),
+        create_mipmapped_rgba8_image(
+            size,
+            size,
+            rough_metal,
+            TextureFormat::Rgba8Unorm,
+            MipmapKind::LinearData,
+            true,
+            false,
+        ),
+    )
+}
+
+struct DynamicHoseSpec {
+    link_a: usize,
+    pos_a: Vec3,
+    tan_a: Vec3,
+    link_b: usize,
+    pos_b: Vec3,
+    tan_b: Vec3,
+    radius: f32,
+    slack: f32,
+    uv_v_scale: f32,
+    is_conduit: bool,
+    clearance: HoseClearance,
+}
+
+fn build_joint_hose_specs() -> [DynamicHoseSpec; 12] {
+    [
+        // 1-2: Link 0 carriage rear glands -> Link 1 riser bottom clamps across base_yaw
+        DynamicHoseSpec {
+            link_a: 0,
+            pos_a: Vec3::new(0.016, 0.028, 0.168),
+            tan_a: Vec3::Y,
+            link_b: 1,
+            pos_b: Vec3::new(0.016, -0.365, 0.136),
+            tan_b: Vec3::Y,
+            radius: 0.0155,
+            slack: 0.24,
+            uv_v_scale: 0.45,
+            is_conduit: true,
+            clearance: HoseClearance::RadialAxis {
+                link: 1,
+                axis: Vec3::Y,
+                min_radius: 0.138,
+                bias_local: Vec3::Z,
+            },
+        },
+        DynamicHoseSpec {
+            link_a: 0,
+            pos_a: Vec3::new(-0.014, 0.028, 0.168),
+            tan_a: Vec3::Y,
+            link_b: 1,
+            pos_b: Vec3::new(-0.014, -0.365, 0.136),
+            tan_b: Vec3::Y,
+            radius: 0.0068,
+            slack: 0.24,
+            uv_v_scale: 0.45,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 1,
+                axis: Vec3::Y,
+                min_radius: 0.138,
+                bias_local: Vec3::Z,
+            },
+        },
+        // 3-4: Link 1 shoulder exit -> Link 2 lower spine across shoulder_pitch
+        DynamicHoseSpec {
+            link_a: 1,
+            pos_a: Vec3::new(0.016, 0.345, 0.136),
+            tan_a: Vec3::new(0.0, 0.88, 0.48).normalize(),
+            link_b: 2,
+            pos_b: Vec3::new(0.016, 0.075, 0.100),
+            tan_b: Vec3::Y,
+            radius: 0.014,
+            slack: 0.38,
+            uv_v_scale: 0.50,
+            is_conduit: true,
+            clearance: HoseClearance::RadialAxis {
+                link: 2,
+                axis: Vec3::X,
+                min_radius: 0.106,
+                bias_local: Vec3::Z,
+            },
+        },
+        DynamicHoseSpec {
+            link_a: 1,
+            pos_a: Vec3::new(-0.014, 0.345, 0.136),
+            tan_a: Vec3::new(0.0, 0.88, 0.48).normalize(),
+            link_b: 2,
+            pos_b: Vec3::new(-0.012, 0.075, 0.100),
+            tan_b: Vec3::Y,
+            radius: 0.0062,
+            slack: 0.38,
+            uv_v_scale: 0.50,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 2,
+                axis: Vec3::X,
+                min_radius: 0.106,
+                bias_local: Vec3::Z,
+            },
+        },
+        // 5-6: Link 2 upper-arm clamp -> Link 3 lower clamp across upper_arm_roll swivel
+        DynamicHoseSpec {
+            link_a: 2,
+            pos_a: Vec3::new(0.016, 0.275, 0.100),
+            tan_a: Vec3::Y,
+            link_b: 3,
+            pos_b: Vec3::new(0.015, 0.085, 0.091),
+            tan_b: Vec3::Y,
+            radius: 0.0135,
+            slack: 0.34,
+            uv_v_scale: 0.45,
+            is_conduit: true,
+            clearance: HoseClearance::RadialAxis {
+                link: 3,
+                axis: Vec3::Y,
+                min_radius: 0.090,
+                bias_local: Vec3::Z,
+            },
+        },
+        DynamicHoseSpec {
+            link_a: 2,
+            pos_a: Vec3::new(-0.012, 0.275, 0.100),
+            tan_a: Vec3::Y,
+            link_b: 3,
+            pos_b: Vec3::new(-0.012, 0.085, 0.091),
+            tan_b: Vec3::Y,
+            radius: 0.0060,
+            slack: 0.34,
+            uv_v_scale: 0.45,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 3,
+                axis: Vec3::Y,
+                min_radius: 0.090,
+                bias_local: Vec3::Z,
+            },
+        },
+        // 7-8: Hero elbow service loop: Link 3 top clamp -> Link 4 forearm spine across elbow_pitch
+        DynamicHoseSpec {
+            link_a: 3,
+            pos_a: Vec3::new(0.015, 0.265, 0.091),
+            tan_a: Vec3::new(0.0, 0.80, 0.60).normalize(),
+            link_b: 4,
+            pos_b: Vec3::new(0.012, 0.080, -0.11),
+            tan_b: Vec3::NEG_Z,
+            radius: 0.0125,
+            slack: 0.62,
+            uv_v_scale: 0.75,
+            is_conduit: true,
+            clearance: HoseClearance::ElbowCounterweight { link4: 4 },
+        },
+        DynamicHoseSpec {
+            link_a: 3,
+            pos_a: Vec3::new(-0.012, 0.265, 0.091),
+            tan_a: Vec3::new(0.0, 0.80, 0.60).normalize(),
+            link_b: 4,
+            pos_b: Vec3::new(-0.011, 0.078, -0.11),
+            tan_b: Vec3::NEG_Z,
+            radius: 0.0056,
+            slack: 0.62,
+            uv_v_scale: 0.75,
+            is_conduit: false,
+            clearance: HoseClearance::ElbowCounterweight { link4: 4 },
+        },
+        // 9-10: Wrist-1 roll conduit & air hose: Link 4 front clamp -> Link 5 saddle/Y-splitter
+        DynamicHoseSpec {
+            link_a: 4,
+            pos_a: Vec3::new(0.012, 0.080, -0.49),
+            tan_a: Vec3::NEG_Z,
+            link_b: 5,
+            pos_b: Vec3::new(0.009, 0.052, -0.022),
+            tan_b: Vec3::NEG_Z,
+            radius: 0.0105,
+            slack: 0.30,
+            uv_v_scale: 0.35,
+            is_conduit: true,
+            clearance: HoseClearance::RadialAxis {
+                link: 5,
+                axis: Vec3::Z,
+                min_radius: 0.050,
+                bias_local: Vec3::Y,
+            },
+        },
+        DynamicHoseSpec {
+            link_a: 4,
+            pos_a: Vec3::new(-0.011, 0.078, -0.49),
+            tan_a: Vec3::NEG_Z,
+            link_b: 5,
+            pos_b: Vec3::new(-0.009, 0.052, -0.022),
+            tan_b: Vec3::NEG_Z,
+            radius: 0.0052,
+            slack: 0.30,
+            uv_v_scale: 0.35,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 5,
+                axis: Vec3::Z,
+                min_radius: 0.050,
+                bias_local: Vec3::Y,
+            },
+        },
+        // 11-12: Twin pneumatic gripper jumpers (Link 5 Y-splitter -> Link 8 brass fittings across wrist_2, wrist_yaw, flange_roll)
+        DynamicHoseSpec {
+            link_a: 5,
+            pos_a: Vec3::new(-0.011, 0.052, -0.032),
+            tan_a: Vec3::new(-0.22, 0.25, -0.94).normalize(),
+            link_b: 8,
+            pos_b: Vec3::new(-0.044, 0.028, -0.010),
+            tan_b: Vec3::NEG_Y,
+            radius: 0.0036,
+            slack: 0.36,
+            uv_v_scale: 0.25,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 6,
+                axis: Vec3::X,
+                min_radius: 0.042,
+                bias_local: Vec3::Y,
+            },
+        },
+        DynamicHoseSpec {
+            link_a: 5,
+            pos_a: Vec3::new(0.011, 0.052, -0.032),
+            tan_a: Vec3::new(0.22, 0.25, -0.94).normalize(),
+            link_b: 8,
+            pos_b: Vec3::new(0.044, 0.028, -0.010),
+            tan_b: Vec3::NEG_Y,
+            radius: 0.0036,
+            slack: 0.36,
+            uv_v_scale: 0.25,
+            is_conduit: false,
+            clearance: HoseClearance::RadialAxis {
+                link: 6,
+                axis: Vec3::X,
+                min_radius: 0.042,
+                bias_local: Vec3::Y,
+            },
+        },
+    ]
+}
+
+fn spawn_dynamic_joint_hoses(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    mats: &RobotMaterials,
+    link_xforms: &[LinkTransform],
+) {
+    let rings = 16usize;
+    let sides = 10usize;
+    for spec in build_joint_hose_specs() {
+        let mut mesh = allocate_tube_mesh(rings, sides);
+        let hose = DynamicJointHose {
+            link_a: spec.link_a,
+            pos_a: spec.pos_a,
+            tan_a: spec.tan_a,
+            link_b: spec.link_b,
+            pos_b: spec.pos_b,
+            tan_b: spec.tan_b,
+            radius: spec.radius,
+            rings,
+            sides,
+            slack: spec.slack,
+            uv_v_scale: spec.uv_v_scale,
+            clearance: spec.clearance,
+            mesh: Handle::default(),
+        };
+        let pts = evaluate_hose_centerline(&hose, link_xforms);
+        write_tube_mesh_in_place(&mut mesh, &pts, hose.radius, hose.sides, hose.uv_v_scale);
+        let mesh_handle = meshes.add(mesh);
+        let mat = if spec.is_conduit {
+            mats.conduit_straight.clone()
+        } else {
+            mats.air_hose.clone()
+        };
+        commands.spawn((
+            DynamicJointHose {
+                mesh: mesh_handle.clone(),
+                ..hose
+            },
+            Mesh3d(mesh_handle),
+            MeshMaterial3d(mat),
+            Transform::IDENTITY,
+            NoFrustumCulling,
+        ));
+    }
+}
+
+fn spawn_dynamic_drag_chain(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    mats: &RobotMaterials,
+    rail_z: f32,
+    initial_q0: f32,
+) {
+    let samples = 24usize;
+    let mut mesh = allocate_drag_chain_mesh(samples);
+    let chain = DynamicDragChain {
+        rail_z,
+        tray_x_anchor: 1.68,
+        chain_len: 3.85,
+        bend_radius: 0.045,
+        samples,
+        mesh: Handle::default(),
+    };
+    let pts = evaluate_drag_chain_centerline(&chain, initial_q0);
+    write_drag_chain_mesh_in_place(&mut mesh, &pts);
+    let mesh_handle = meshes.add(mesh);
+    commands.spawn((
+        DynamicDragChain {
+            mesh: mesh_handle.clone(),
+            ..chain
+        },
+        Mesh3d(mesh_handle),
+        MeshMaterial3d(mats.conduit_straight.clone()),
+        Transform::IDENTITY,
+        NoFrustumCulling,
+    ));
+}
+
+pub fn evaluate_hose_centerline(hose: &DynamicJointHose, link_xforms: &[LinkTransform]) -> Vec<Vec3> {
+    let xa = link_xforms[hose.link_a];
+    let xb = link_xforms[hose.link_b];
+    let p0 = xa.pos + xa.rot * hose.pos_a;
+    let p1 = xb.pos + xb.rot * hose.pos_b;
+    let d0 = (xa.rot * hose.tan_a).normalize_or(Vec3::Y);
+    let d1 = (xb.rot * hose.tan_b).normalize_or(Vec3::Y);
+
+    let chord = p0.distance(p1).max(0.015);
+    let m_len = chord * (0.48 + hose.slack);
+    let m0 = d0 * m_len;
+    let m1 = d1 * m_len;
+
+    let rings = hose.rings.max(2);
+    let mut pts = Vec::with_capacity(rings);
+    for i in 0..rings {
+        let t = i as f32 / (rings - 1) as f32;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let mut pt = p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11;
+
+        if i > 0 && i + 1 < rings {
+            let blend = (t * 5.0).min((1.0 - t) * 5.0).clamp(0.0, 1.0);
+            match hose.clearance {
+                HoseClearance::None => {}
+                HoseClearance::RadialAxis {
+                    link,
+                    axis,
+                    min_radius,
+                    bias_local,
+                } => {
+                    let xf = link_xforms[link];
+                    let inv_rot = xf.rot.inverse();
+                    let local = inv_rot * (pt - xf.pos);
+                    let ax = axis.normalize_or(Vec3::Y);
+                    let proj = ax * local.dot(ax);
+                    let rad_vec = local - proj;
+                    let r_cur = rad_vec.length();
+                    let req_r = min_radius + hose.radius;
+                    let bias_perp = (bias_local - ax * bias_local.dot(ax)).normalize_or(Vec3::Z);
+                    let dir = if r_cur > 1e-4 {
+                        let d = rad_vec / r_cur;
+                        if d.dot(bias_perp) < -0.15 {
+                            bias_perp
+                        } else {
+                            d
+                        }
+                    } else {
+                        bias_perp
+                    };
+                    if r_cur < req_r || rad_vec.dot(bias_perp) < 0.0 {
+                        let pushed = proj + dir * r_cur.max(req_r);
+                        let resolved = local.lerp(pushed, blend);
+                        pt = xf.pos + xf.rot * resolved;
+                    }
+                }
+                HoseClearance::ElbowCounterweight { link4 } => {
+                    let xf = link_xforms[link4];
+                    let inv_rot = xf.rot.inverse();
+                    let mut local = inv_rot * (pt - xf.pos);
+                    let r_pad = hose.radius;
+
+                    // 1. Keep outside elbow drum (cylinder along X, r = 0.082)
+                    let drum_r = 0.082 + r_pad;
+                    let yz = Vec2::new(local.y, local.z);
+                    let yz_len = yz.length();
+                    if yz_len < drum_r {
+                        let dir_yz = if yz_len > 1e-4 {
+                            let d = yz / yz_len;
+                            if d.x < -0.25 && d.y < 0.0 {
+                                Vec2::new(0.70, 0.71)
+                            } else {
+                                d
+                            }
+                        } else {
+                            Vec2::new(0.70, 0.71)
+                        };
+                        let pushed_yz = dir_yz * drum_r;
+                        local.y = local.y + (pushed_yz.x - local.y) * blend;
+                        local.z = local.z + (pushed_yz.y - local.z) * blend;
+                    }
+
+                    // 2. Keep outside rear counterweight housing (x ±0.068, y -0.056..0.088, z -0.015..0.168)
+                    let bx = 0.068 + r_pad;
+                    let by_min = -0.056 - r_pad;
+                    let by_max = 0.088 + r_pad;
+                    let bz_min = -0.015;
+                    let bz_max = 0.168 + r_pad;
+                    if local.x.abs() < bx
+                        && local.y > by_min
+                        && local.y < by_max
+                        && local.z > bz_min
+                        && local.z < bz_max
+                    {
+                        let dy = by_max - local.y;
+                        let dz = bz_max - local.z;
+                        if dy <= dz {
+                            local.y += (by_max - local.y) * blend;
+                        } else {
+                            local.z += (bz_max - local.z) * blend;
+                        }
+                    }
+
+                    pt = xf.pos + xf.rot * local;
+                }
+            }
+        }
+        pts.push(pt);
+    }
+    pts
+}
+
+pub fn evaluate_drag_chain_centerline(chain: &DynamicDragChain, q0: f32) -> Vec<(Vec3, Vec3)> {
+    // Tray lies at Z = rail_z - 0.172, bottom support at y = 0.065, carriage entry at y = 0.155
+    let z = chain.rail_z - 0.172;
+    let r = chain.bend_radius;
+    let y_bot = 0.065_f32;
+    let y_top = y_bot + 2.0 * r;
+    let x_anchor = chain.tray_x_anchor;
+    let x_bend = (0.5 * (x_anchor + q0 + PI * r - chain.chain_len))
+        .clamp(-1.95, q0.min(x_anchor) - 0.10);
+
+    let count = chain.samples.max(8);
+    let n_arc = (count / 2).max(6).min(count - 2);
+    let n_bot = (count - n_arc) / 2;
+    let n_top = count - n_arc - n_bot;
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..n_bot {
+        let frac = i as f32 / (n_bot as f32);
+        let x = x_anchor - frac * (x_anchor - x_bend);
+        out.push((Vec3::new(x, y_bot, z), Vec3::NEG_X));
+    }
+    for k in 0..n_arc {
+        let theta = PI * (k as f32 / (n_arc - 1) as f32);
+        let cx = x_bend - r * theta.sin();
+        let cy = y_bot + r * (1.0 - theta.cos());
+        let tan = Vec3::new(-theta.cos(), theta.sin(), 0.0).normalize();
+        out.push((Vec3::new(cx, cy, z), tan));
+    }
+    for k in 1..=n_top {
+        let frac = k as f32 / (n_top as f32);
+        let x = x_bend + frac * (q0 - x_bend);
+        out.push((Vec3::new(x, y_top, z), Vec3::X));
+    }
+    out
+}
+
+fn allocate_tube_mesh(rings: usize, sides: usize) -> Mesh {
+    let vert_count = rings * (sides + 1);
+    let mut indices = Vec::with_capacity((rings - 1) * sides * 6);
+    let stride = (sides + 1) as u32;
+    for i in 0..(rings - 1) as u32 {
+        let r0 = i * stride;
+        let r1 = (i + 1) * stride;
+        for j in 0..sides as u32 {
+            let a = r0 + j;
+            let b = r1 + j;
+            let c = r0 + j + 1;
+            let d = r1 + j + 1;
+            indices.extend_from_slice(&[a, c, b, c, d, b]);
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0_f32; 3]; vert_count])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0_f32, 1.0, 0.0]; vert_count])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0_f32; 2]; vert_count])
+    .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0_f32, 0.0, 0.0, 1.0]; vert_count])
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+fn write_tube_mesh_in_place(
+    mesh: &mut Mesh,
+    points: &[Vec3],
+    radius: f32,
+    sides: usize,
+    uv_v_scale: f32,
+) {
+    let rings = points.len();
+    if rings < 2 {
+        return;
+    }
+
+    let mut tangents = Vec::with_capacity(rings);
+    for i in 0..rings {
+        let t = if i == 0 {
+            (points[1] - points[0]).normalize_or(Vec3::Y)
+        } else if i + 1 == rings {
+            (points[i] - points[i - 1]).normalize_or(Vec3::Y)
+        } else {
+            (points[i + 1] - points[i - 1]).normalize_or(Vec3::Y)
+        };
+        tangents.push(t);
+    }
+
+    // Initialize parallel-transport Bishop frame
+    let t0 = tangents[0];
+    let ref_hint = if t0.dot(Vec3::X).abs() < 0.85 {
+        Vec3::X
+    } else {
+        Vec3::Z
+    };
+    let mut u_ax = (ref_hint - t0 * ref_hint.dot(t0)).normalize_or(Vec3::Z);
+
+    let mut total_s = 0.0_f32;
+    let stride = sides + 1;
+    let expected = rings * stride;
+
+    // Collect into flat attribute vectors or write in place
+    let mut new_pos = Vec::with_capacity(expected);
+    let mut new_norm = Vec::with_capacity(expected);
+    let mut new_uv = Vec::with_capacity(expected);
+    let mut new_tan = Vec::with_capacity(expected);
+
+    for i in 0..rings {
+        let ti = tangents[i];
+        if i > 0 {
+            total_s += points[i].distance(points[i - 1]);
+            let t_prev = tangents[i - 1];
+            if t_prev.dot(ti) > -0.9999 {
+                u_ax = Quat::from_rotation_arc(t_prev, ti) * u_ax;
+            }
+            u_ax = (u_ax - ti * u_ax.dot(ti)).normalize_or(Vec3::X);
+        }
+        let v_ax = ti.cross(u_ax).normalize_or(Vec3::Z);
+        let v_uv = total_s * (uv_v_scale / 0.15).max(0.5);
+
+        for j in 0..=sides {
+            let u_uv = j as f32 / sides as f32;
+            let theta = TAU * u_uv;
+            let (st, ct) = theta.sin_cos();
+            let n = (u_ax * ct + v_ax * st).normalize();
+            let d_theta = (-u_ax * st + v_ax * ct).normalize();
+            let p = points[i] + n * radius;
+
+            new_pos.push([p.x, p.y, p.z]);
+            new_norm.push([n.x, n.y, n.z]);
+            new_uv.push([u_uv, v_uv]);
+            new_tan.push([d_theta.x, d_theta.y, d_theta.z, -1.0]);
+        }
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, new_pos);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, new_norm);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, new_uv);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, new_tan);
+}
+
+fn allocate_drag_chain_mesh(samples: usize) -> Mesh {
+    allocate_tube_mesh(samples, 8)
+}
+
+fn write_drag_chain_mesh_in_place(mesh: &mut Mesh, centerline: &[(Vec3, Vec3)]) {
+    let rings = centerline.len();
+    if rings < 2 {
+        return;
+    }
+    const SIDES: usize = 8;
+    const HW: f32 = 0.019;
+    const HH: f32 = 0.009;
+    // Chamfered rectangular Igus-style link profile in (z_local, n_local)
+    const PROFILE: [[f32; 2]; 8] = [
+        [HW, HH * 0.65],
+        [HW * 0.72, HH],
+        [-HW * 0.72, HH],
+        [-HW, HH * 0.65],
+        [-HW, -HH * 0.65],
+        [-HW * 0.72, -HH],
+        [HW * 0.72, -HH],
+        [HW, -HH * 0.65],
+    ];
+
+    let vert_count = rings * (SIDES + 1);
+    let mut new_pos = Vec::with_capacity(vert_count);
+    let mut new_norm = Vec::with_capacity(vert_count);
+    let mut new_uv = Vec::with_capacity(vert_count);
+    let mut new_tan = Vec::with_capacity(vert_count);
+
+    let mut total_s = 0.0_f32;
+    for (i, &(pos, tan)) in centerline.iter().enumerate() {
+        if i > 0 {
+            total_s += pos.distance(centerline[i - 1].0);
+        }
+        let u_ax = Vec3::Z;
+        let v_ax = tan.cross(u_ax).normalize_or(Vec3::Y);
+        let v_uv = total_s * 6.0;
+
+        for j in 0..=SIDES {
+            let idx = j % SIDES;
+            let [pz, pn] = PROFILE[idx];
+            let offset = u_ax * pz + v_ax * pn;
+            let p = pos + offset;
+            let n = offset.normalize_or(Vec3::Y);
+            let d_theta = tan.cross(n).normalize_or(Vec3::Z);
+
+            new_pos.push([p.x, p.y, p.z]);
+            new_norm.push([n.x, n.y, n.z]);
+            new_uv.push([j as f32 / SIDES as f32, v_uv]);
+            new_tan.push([d_theta.x, d_theta.y, d_theta.z, -1.0]);
+        }
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, new_pos);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, new_norm);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, new_uv);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, new_tan);
+}
+
+fn update_dynamic_dress_pack(
+    spray_job: Res<SprayJobRes>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    hose_q: Query<&DynamicJointHose>,
+    drag_q: Query<&DynamicDragChain>,
+) {
+    let joints = &spray_job.current_frame.joints;
+    let link_xforms = spray_job.chain.fk_links(joints);
+    let q0 = joints[0] as f32;
+
+    for hose in &hose_q {
+        if let Some(mut mesh) = meshes.get_mut(&hose.mesh) {
+            let pts = evaluate_hose_centerline(hose, &link_xforms);
+            write_tube_mesh_in_place(&mut mesh, &pts, hose.radius, hose.sides, hose.uv_v_scale);
+        }
+    }
+
+    for chain in &drag_q {
+        if let Some(mut mesh) = meshes.get_mut(&chain.mesh) {
+            let pts = evaluate_drag_chain_centerline(chain, q0);
+            write_drag_chain_mesh_in_place(&mut mesh, &pts);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1987,6 +2851,8 @@ mod tests {
 
     #[test]
     fn procedural_robot_textures_and_tangent_meshes_are_valid() {
+        use crate::sim::textures::{mip_chain_byte_len_rgba8, mip_level_count_2d};
+
         for (a, rm, n) in [
             build_cast_iron_textures(64),
             build_safety_orange_textures(64, 0.0),
@@ -2000,26 +2866,61 @@ mod tests {
             for img in [&a, &rm, &n] {
                 assert_eq!(img.texture_descriptor.size.width, 64);
                 assert_eq!(img.texture_descriptor.size.height, 64);
-                assert_eq!(img.data.as_ref().map(|d| d.len()), Some(64 * 64 * 4));
+                assert_eq!(img.texture_descriptor.mip_level_count, mip_level_count_2d(64, 64));
+                assert_eq!(
+                    img.data.as_ref().map(|d| d.len()),
+                    Some(mip_chain_byte_len_rgba8(64, 64))
+                );
             }
         }
 
         let unit07 = build_unit07_stencil_texture(512, 192);
         assert_eq!(unit07.texture_descriptor.size.width, 512);
         assert_eq!(unit07.texture_descriptor.size.height, 192);
-        assert_eq!(unit07.data.as_ref().map(|d| d.len()), Some(512 * 192 * 4));
+        assert_eq!(
+            unit07.texture_descriptor.mip_level_count,
+            mip_level_count_2d(512, 192)
+        );
+        assert_eq!(
+            unit07.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(512, 192))
+        );
 
         let chev = build_hazard_chevron_texture(256, 64);
         assert_eq!(chev.texture_descriptor.size.width, 256);
         assert_eq!(chev.texture_descriptor.size.height, 64);
+        assert_eq!(
+            chev.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(256, 64))
+        );
 
         let dial = build_encoder_dial_texture(128);
         assert_eq!(dial.texture_descriptor.size.width, 128);
         assert_eq!(dial.texture_descriptor.size.height, 128);
+        assert_eq!(
+            dial.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
 
         let scale = build_degree_scale_collar_texture(256, 32);
         assert_eq!(scale.texture_descriptor.size.width, 256);
         assert_eq!(scale.texture_descriptor.size.height, 32);
+        assert_eq!(
+            scale.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(256, 32))
+        );
+
+        let (can_a, can_rm) = build_spray_can_label_textures([232, 93, 26], 0, 128);
+        assert_eq!(can_a.texture_descriptor.size.width, 128);
+        assert_eq!(can_rm.texture_descriptor.size.height, 128);
+        assert_eq!(
+            can_a.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
+        assert_eq!(
+            can_rm.data.as_ref().map(|d| d.len()),
+            Some(mip_chain_byte_len_rgba8(128, 128))
+        );
 
         // Verify tangent generation succeeds on every primitive type used on the robot
         let meshes_with_tangents = [
@@ -2114,5 +3015,124 @@ mod tests {
         let mut trigger_q = world.query_filtered::<&ChildOf, With<TriggerFinger>>();
         let trigger_parents: Vec<Entity> = trigger_q.iter(world).map(|p| p.parent()).collect();
         assert_eq!(trigger_parents, vec![link8]);
+    }
+
+    #[test]
+    fn dynamic_joint_hoses_stay_connected_and_clear_joints_across_extreme_poses() {
+        use crate::core::kinematics::KinematicChain;
+        use crate::core::types::StudioConfig;
+
+        let studio = StudioConfig::default();
+        let chain = KinematicChain::default_spraybot(&studio);
+        let poses: [[f64; 9]; 5] = [
+            chain.comfort_pose,
+            [1.38, -0.25, 0.15, 0.0, 1.10, 0.0, -1.25, 0.0, 0.0],
+            [-1.40, 1.35, -1.15, 1.55, -1.85, 1.40, -1.30, 1.10, 2.20],
+            [0.85, -1.45, 0.85, -1.55, 1.95, -1.60, 1.15, -1.15, -2.10],
+            [-1.70, 2.60, -0.35, 0.65, 1.45, -0.75, 0.45, 0.85, 0.90],
+        ];
+
+        for q in &poses {
+            let xforms = chain.fk_links(q);
+            for (idx, spec) in build_joint_hose_specs().into_iter().enumerate() {
+                let hose = DynamicJointHose {
+                    link_a: spec.link_a,
+                    pos_a: spec.pos_a,
+                    tan_a: spec.tan_a,
+                    link_b: spec.link_b,
+                    pos_b: spec.pos_b,
+                    tan_b: spec.tan_b,
+                    radius: spec.radius,
+                    rings: 16,
+                    sides: 10,
+                    slack: spec.slack,
+                    uv_v_scale: spec.uv_v_scale,
+                    clearance: spec.clearance,
+                    mesh: Handle::default(),
+                };
+                let pts = evaluate_hose_centerline(&hose, &xforms);
+                assert_eq!(pts.len(), 16);
+
+                let expected_a = xforms[spec.link_a].pos + xforms[spec.link_a].rot * spec.pos_a;
+                let expected_b = xforms[spec.link_b].pos + xforms[spec.link_b].rot * spec.pos_b;
+                assert!(
+                    (pts[0] - expected_a).length() < 1e-4,
+                    "hose {idx} detached from start anchor on link {} at pose {q:?}",
+                    spec.link_a
+                );
+                assert!(
+                    (pts[15] - expected_b).length() < 1e-4,
+                    "hose {idx} detached from end anchor on link {} at pose {q:?}",
+                    spec.link_b
+                );
+                for (k, &p) in pts.iter().enumerate() {
+                    assert!(p.is_finite(), "hose {idx} pt {k} non-finite");
+                    assert!(
+                        p.z > 0.02,
+                        "hose {idx} pt {k} z={:.4} came too close to canvas",
+                        p.z
+                    );
+                }
+
+                // Interior points of ElbowCounterweight hose must clear Link 4 drum & counterweight
+                if let HoseClearance::ElbowCounterweight { link4 } = spec.clearance {
+                    let xf4 = xforms[link4];
+                    let inv4 = xf4.rot.inverse();
+                    for &p in &pts[3..13] {
+                        let loc = inv4 * (p - xf4.pos);
+                        let yz_r = (loc.y * loc.y + loc.z * loc.z).sqrt();
+                        assert!(
+                            yz_r >= 0.080 + spec.radius - 1e-3,
+                            "elbow hose clipped Link 4 drum: yz_r={yz_r:.4}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drag chain length & bounds check across full rail range
+        let dc = DynamicDragChain {
+            rail_z: studio.rail_z,
+            tray_x_anchor: 1.68,
+            chain_len: 3.85,
+            bend_radius: 0.045,
+            samples: 24,
+            mesh: Handle::default(),
+        };
+        for q0 in [studio.rail_q0_min, -0.5, 0.0, 0.8, studio.rail_q0_max] {
+            let pts = evaluate_drag_chain_centerline(&dc, q0);
+            assert_eq!(pts.len(), 24);
+            assert!((pts[0].0.x - 1.68).abs() < 1e-4);
+            assert!((pts[23].0.x - q0).abs() < 1e-4);
+            for (p, _) in &pts {
+                assert!(p.x >= -2.01 && p.x <= 1.72, "drag chain out of tray: {}", p.x);
+                assert!(p.y >= 0.06 && p.y <= 0.16, "drag chain y out of bounds: {}", p.y);
+            }
+        }
+    }
+
+    #[test]
+    fn can_body_label_yaws_vary_across_slots_deterministically() {
+        for seed in [0_u64, 42, 1337] {
+            let yaws: Vec<f32> = (0..16).map(|s| can_body_label_yaw(s, seed)).collect();
+            for &y in &yaws {
+                assert!(y >= 0.0 && y < TAU, "yaw out of [0, TAU): {y}");
+            }
+            for s in 0..16 {
+                assert_eq!(yaws[s], can_body_label_yaw(s, seed));
+            }
+            for pair in yaws.windows(2) {
+                let mut diff = (pair[1] - pair[0]).abs();
+                if diff > PI {
+                    diff = TAU - diff;
+                }
+                assert!(
+                    diff >= 0.25,
+                    "adjacent can label yaws too similar: {} vs {} (diff={diff:.4})",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
     }
 }
