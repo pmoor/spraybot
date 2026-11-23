@@ -123,6 +123,14 @@ pub fn trigger_local_transform(trigger_depressed: f32) -> Transform {
         .with_rotation(Quat::from_rotation_x(-0.24 * t))
 }
 
+/// Deterministic per-slot label yaw in `[0, TAU)` so stored cans sit at natural radial angles
+/// while the detachable nozzle actuator stays aligned along `-Z` for gripper/cockpit repeatability.
+pub fn can_body_label_yaw(slot_index: usize, seed: u64) -> f32 {
+    let seed_mix = ((seed ^ (seed >> 32)) as u32).wrapping_add(4099);
+    let jitter = hash2(slot_index as i32, (slot_index as i32).wrapping_mul(7) + 3, seed_mix);
+    ((slot_index as f32 * 0.618_034 + jitter * 0.45).fract()) * TAU
+}
+
 struct RobotMaterials {
     cast_iron: Handle<StandardMaterial>,
     anodized_dark: Handle<StandardMaterial>,
@@ -1005,6 +1013,7 @@ fn spawn_robot_and_cans(
         } else {
             Visibility::Hidden
         };
+        let body_yaw = can_body_label_yaw(can.slot_index, app_config.cli.seed);
 
         commands.spawn((
             CanEntity {
@@ -1023,7 +1032,8 @@ fn spawn_robot_and_cans(
                 (
                     Mesh3d(body_mesh.clone()),
                     MeshMaterial3d(body_mat),
-                    Transform::from_xyz(0.0, -0.014, 0.0),
+                    Transform::from_xyz(0.0, -0.014, 0.0)
+                        .with_rotation(Quat::from_rotation_y(body_yaw)),
                 ),
                 (
                     Mesh3d(crimp_ring_mesh.clone()),
@@ -3040,6 +3050,31 @@ mod tests {
             for (p, _) in &pts {
                 assert!(p.x >= -2.01 && p.x <= 1.72, "drag chain out of tray: {}", p.x);
                 assert!(p.y >= 0.06 && p.y <= 0.16, "drag chain y out of bounds: {}", p.y);
+            }
+        }
+    }
+
+    #[test]
+    fn can_body_label_yaws_vary_across_slots_deterministically() {
+        for seed in [0_u64, 42, 1337] {
+            let yaws: Vec<f32> = (0..16).map(|s| can_body_label_yaw(s, seed)).collect();
+            for &y in &yaws {
+                assert!(y >= 0.0 && y < TAU, "yaw out of [0, TAU): {y}");
+            }
+            for s in 0..16 {
+                assert_eq!(yaws[s], can_body_label_yaw(s, seed));
+            }
+            for pair in yaws.windows(2) {
+                let mut diff = (pair[1] - pair[0]).abs();
+                if diff > PI {
+                    diff = TAU - diff;
+                }
+                assert!(
+                    diff >= 0.25,
+                    "adjacent can label yaws too similar: {} vs {} (diff={diff:.4})",
+                    pair[0],
+                    pair[1]
+                );
             }
         }
     }
